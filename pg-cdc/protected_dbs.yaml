@@ -1,0 +1,61 @@
+# =============================================================================
+# pg-cdc — Per-Database Logical Replication Backup Configuration
+# =============================================================================
+# Each entry under `databases` adds that DB to the CDC capture and creates
+# a corresponding systemd unit instance. Adding a new DB requires only a new
+# entry here + running `pg-cdc setup <dbname>`.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Global: shared PostgreSQL cluster connection
+# ---------------------------------------------------------------------------
+# Used for managing replication slots, publications, and monitoring queries.
+# Must have replication privileges and be a superuser or have appropriate
+# GRANTs (REPLICATION, pg_create_subscription, etc.).
+pg_connection: "postgresql://postgres:password@localhost:5432/postgres"
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+capture_dir: /var/pg-cdc
+backup_dir: /var/backups/pg
+scripts_dir: /etc/pg-cdc
+
+# ---------------------------------------------------------------------------
+# Safety valve — protects the cluster from unbounded WAL growth
+# ---------------------------------------------------------------------------
+# If a slot's lag exceeds max_lag_bytes AND its capture daemon has been
+# confirmed dead for longer than grace_period_seconds, the slot is
+# automatically dropped. This is logged loudly and must be explicitly
+# acknowledged in the runbook.
+safety_valve:
+  max_lag_bytes: 1073741824       # 1 GB — hard ceiling
+  grace_period_seconds: 300       # 5 min — grace after daemon dies
+
+# ---------------------------------------------------------------------------
+# Monitoring thresholds
+# ---------------------------------------------------------------------------
+monitoring:
+  lag_warn_bytes: 52428800                 # 50 MB — alert if lag exceeds this
+  slot_inactive_seconds: 600               # 10 min — alert if not advancing
+  stream_stale_seconds: 120                # 2 min — alert if file not written
+  check_interval_seconds: 60               # How often monitor runs
+
+# ---------------------------------------------------------------------------
+# Baseline dump settings
+# ---------------------------------------------------------------------------
+baseline_concurrency: 3                    # Max simultaneous pg_dump runs
+
+# ---------------------------------------------------------------------------
+# Protected databases
+# ---------------------------------------------------------------------------
+databases:
+  - name: test
+    retention_days: 30
+    baseline_cron: "0 3 * * *"
+    baseline_offset_minutes: 0
+
+  - name: test2
+    retention_days: 14
+    baseline_cron: "0 3 * * *"
+    baseline_offset_minutes: 5

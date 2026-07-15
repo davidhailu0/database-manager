@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=pg-cdc health checkpoint for %i
+Documentation=https://github.com/your-org/pg-cdc
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/pg-cdc/health_check.sh
+User=root
+Group=root
+Environment=HEALTH_CHECK_URL=http://localhost:3000
+StandardOutput=journal
+StandardError=journal

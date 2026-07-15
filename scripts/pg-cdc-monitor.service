@@ -1,0 +1,10 @@
+[Unit]
+Description=pg-cdc monitoring check
+Documentation=https://github.com/anomalyco/database-management
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/pg-cdc/pg-cdc.env
+ExecStart=/etc/pg-cdc/monitor.sh

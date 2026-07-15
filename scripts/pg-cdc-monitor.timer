@@ -1,0 +1,9 @@
+[Unit]
+Description=pg-cdc monitoring every 60 seconds
+
+[Timer]
+OnCalendar=*:*:00/60
+Persistent=false
+
+[Install]
+WantedBy=timers.target

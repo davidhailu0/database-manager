@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly rotation of pg-cdc stream file for database %i
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

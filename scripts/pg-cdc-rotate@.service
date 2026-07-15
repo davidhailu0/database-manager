@@ -1,0 +1,11 @@
+[Unit]
+Description=Rotate pg-cdc stream file for database %i
+Documentation=https://github.com/anomalyco/database-management
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/pg-cdc/pg-cdc.env
+Environment=PGCDC_DB=%i
+ExecStart=/etc/pg-cdc/rotate_stream.sh %i

@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# =============================================================================
+# backup_db.sh — Create a pg_dump baseline for a single database
+# =============================================================================
+# Produces a custom-format (-Fc) dump with a timestamped filename, then
+# verifies integrity via pg_restore --list.
+#
+# Usage: backup_db.sh <dbname>
+#
+# Environment (via pg-cdc.env):
+#   PGCDC_CONNECTION_STRING  — connection URI (used to derive per-DB URI)
+#   PGCDC_BACKUP_DIR         — base backup directory
+#   PGCDC_ALERT_COMMAND      — alert hook script
+# =============================================================================
+set -euo pipefail
+
+DB="${1:?Usage: $0 <dbname>}"
+BACKUP_DIR="${PGCDC_BACKUP_DIR:-/var/backups/pg}/${DB}"
+ALERT_CMD="${PGCDC_ALERT_COMMAND:-/etc/pg-cdc/alert.sh}"
+TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
+DUMP_FILE="${BACKUP_DIR}/base_${TIMESTAMP}.dump"
+LOG_FILE="${BACKUP_DIR}/backup_${TIMESTAMP}.log"
+
+mkdir -p "${BACKUP_DIR}"
+
+echo "[BACKUP] [${DB}] Starting baseline dump → ${DUMP_FILE}"
+
+# ---- 1. pg_dump ----
+# Derive connection string for the target DB from the management connection
+# by replacing the database name in the URI.
+if echo "${PGCDC_CONNECTION_STRING}" | grep -q '/[^/]*$'; then
+  BASE_CONN=$(echo "${PGCDC_CONNECTION_STRING}" | sed 's|/[^/]*$|/|')
+else
+  BASE_CONN="${PGCDC_CONNECTION_STRING}"
+fi
+DB_CONN="${BASE_CONN}${DB}"
+
+if ! pg_dump "${DB_CONN}" --format=custom --file="${DUMP_FILE}" > "${LOG_FILE}" 2>&1; then
+  echo "[BACKUP] [${DB}] ❌ pg_dump FAILED"
+  cat "${LOG_FILE}"
+  "${ALERT_CMD}" "backup-failed" "${DB}" "pg_dump failed — see ${LOG_FILE}"
+  exit 1
+fi
+
+echo "[BACKUP] [${DB}] pg_dump completed"
+
+# ---- 2. Verify integrity ---
+if ! pg_restore --list "${DUMP_FILE}" > /dev/null 2>> "${LOG_FILE}"; then
+  echo "[BACKUP] [${DB}] ❌ Integrity check FAILED — dump file is corrupt"
+  "${ALERT_CMD}" "backup-corrupt" "${DB}" "Dump file ${DUMP_FILE} failed pg_restore --list"
+  rm -f "${DUMP_FILE}"
+  exit 1
+fi
+
+DUMP_SIZE=$(stat --format=%s "${DUMP_FILE}" 2>/dev/null || echo 0)
+echo "[BACKUP] [${DB}] ✅ Baseline complete: ${DUMP_FILE} ($(( DUMP_SIZE / 1048576 )) MB)"
+
+# ---- 3. Apply retention ---
+RETENTION_DAYS="${PGCDC_RETENTION_DAYS:-30}"
+if [ "${RETENTION_DAYS}" -gt 0 ]; then
+  echo "[BACKUP] [${DB}] Applying retention: ${RETENTION_DAYS} days"
+
+  # Remove outdated dump files
+  find "${BACKUP_DIR}" -name 'base_*.dump' -type f -mtime "+${RETENTION_DAYS}" -print -delete 2>/dev/null || true
+
+  # Remove outdated backup logs
+  find "${BACKUP_DIR}" -name 'backup_*.log' -type f -mtime "+${RETENTION_DAYS}" -print -delete 2>/dev/null || true
+
+  # WAL / stream JSONL files are cleaned periodically by cleanup_cdc.sh (cron)
+fi
+
+exit 0

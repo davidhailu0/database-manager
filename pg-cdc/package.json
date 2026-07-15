@@ -1,0 +1,25 @@
+{
+  "name": "pg-cdc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Per-database logical replication backup & point-in-time recovery for PostgreSQL",
+  "bin": {
+    "pg-cdc": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "postgres": "^3.4.9"
+  },
+  "devDependencies": {
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20",
+    "tsx": "^4.19.0",
+    "typescript": "^5"
+  }
+}

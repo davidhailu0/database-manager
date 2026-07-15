@@ -1,0 +1,24 @@
+[Unit]
+Description=pg-cdc capture daemon for database %i
+Documentation=https://github.com/anomalyco/database-management
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=postgres
+Group=postgres
+EnvironmentFile=/etc/pg-cdc/pg-cdc.env
+Environment=PGCDC_DB=%i
+ExecStart=/etc/pg-cdc/capture-daemon.mjs %i
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Soft limit: 1 GB core, 10 000 open files
+LimitCORE=1G
+LimitNOFILE=10000
+
+[Install]
+WantedBy=multi-user.target
