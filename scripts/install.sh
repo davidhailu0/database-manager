@@ -139,7 +139,7 @@ echo ""
 
 # ---- Config destinations ----
 CONFIG_DEST="/etc/pg-cdc"
-PGBACKREST_DEST="/etc/pgbackrest"
+# PGBACKREST_DEST="/etc/pgbackrest"
 SYSTEMD_DEST="/etc/systemd/system"
 LOCAL_BIN="/usr/local/bin"
 SUDOERS_DEST="/etc/sudoers.d/db-manager"
@@ -177,41 +177,40 @@ fi
 # =============================================================================
 echo "--- Config dirs ---"
 run mkdir -p "${CONFIG_DEST}"
-run mkdir -p "${PGBACKREST_DEST}"
+# run mkdir -p "${PGBACKREST_DEST}"
 run mkdir -p /var/pg-cdc
 run mkdir -p /var/backups/pg
 run mkdir -p /var/log/pg-cdc
-run mkdir -p /var/lib/pgbackrest
+# run mkdir -p /var/lib/pgbackrest
 # The CDC capture daemon (pg-cdc@.service) runs as User=postgres and writes
-# stream files to /var/pg-cdc/<db>/.  The backup script and pgBackRest also
-# need postgres-writable directories.  Without this chown the daemon fails with
+# stream files to /var/pg-cdc/<db>/.  Without this chown the daemon fails with
 # EACCES when it tries to create or append to stream_current.jsonl.
 if id postgres >/dev/null 2>&1; then
   run chown postgres:postgres /var/pg-cdc
   run chown postgres:postgres /var/backups/pg
   run chown postgres:postgres /var/log/pg-cdc
-  run chown postgres:postgres /var/lib/pgbackrest
+  # run chown postgres:postgres /var/lib/pgbackrest
 fi
 # Allow the app user to write configs (dev convenience + API writeConfigFile)
 run chown -R "${INSTALL_USER}:${INSTALL_USER}" "${CONFIG_DEST}" 2>/dev/null || true
-run chown "${INSTALL_USER}:${INSTALL_USER}" "${PGBACKREST_DEST}" 2>/dev/null || true
-if [ ! -f "${PGBACKREST_DEST}/pgbackrest.conf" ]; then
-  if $DRY_RUN; then
-    echo "  [dry-run] create empty pgbackrest.conf"
-  else
-    cat > "${PGBACKREST_DEST}/pgbackrest.conf" <<'EOF'
-[global]
-repo1-path=/var/lib/pgbackrest
-repo1-retention-full=2
-start-fast=y
-EOF
-    chown "${INSTALL_USER}:${INSTALL_USER}" "${PGBACKREST_DEST}/pgbackrest.conf" 2>/dev/null || true
-    echo "  created ${PGBACKREST_DEST}/pgbackrest.conf"
-  fi
-fi
+# run chown "${INSTALL_USER}:${INSTALL_USER}" "${PGBACKREST_DEST}" 2>/dev/null || true
+# if [ ! -f "${PGBACKREST_DEST}/pgbackrest.conf" ]; then
+#   if $DRY_RUN; then
+#     echo "  [dry-run] create empty pgbackrest.conf"
+#   else
+#     cat > "${PGBACKREST_DEST}/pgbackrest.conf" <<'EOF'
+# [global]
+# repo1-path=/var/lib/pgbackrest
+# repo1-retention-full=2
+# start-fast=y
+# EOF
+#     chown "${INSTALL_USER}:${INSTALL_USER}" "${PGBACKREST_DEST}/pgbackrest.conf" 2>/dev/null || true
+#     echo "  created ${PGBACKREST_DEST}/pgbackrest.conf"
+#   fi
+# fi
 echo "  ${CONFIG_DEST}"
-echo "  ${PGBACKREST_DEST}"
-echo "  /var/pg-cdc /var/backups/pg /var/log/pg-cdc /var/lib/pgbackrest"
+# echo "  ${PGBACKREST_DEST}"
+echo "  /var/pg-cdc /var/backups/pg /var/log/pg-cdc"
 
 # =============================================================================
 # 2. Config files
@@ -278,27 +277,27 @@ fi
 # =============================================================================
 # 6. Optional host packages (pgBackRest) when apt is available
 # =============================================================================
-echo "--- Host packages ---"
-if command -v apt-get >/dev/null 2>&1; then
-  if command -v pgbackrest >/dev/null 2>&1; then
-    echo "  [ok] pgbackrest already installed ($(pgbackrest version 2>/dev/null | head -1 || echo present))"
-  else
-    if $DRY_RUN; then
-      echo "  [dry-run] apt-get install -y pgbackrest"
-    else
-      echo "  Installing pgbackrest..."
-      export DEBIAN_FRONTEND=noninteractive
-      apt-get update -qq
-      if apt-get install -y pgbackrest; then
-        echo "  [ok] pgbackrest installed"
-      else
-        echo "  WARNING: could not install pgbackrest (optional for cluster backups)"
-      fi
-    fi
-  fi
-else
-  echo "  (apt-get not available — skipping package installs)"
-fi
+# echo "--- Host packages ---"
+# if command -v apt-get >/dev/null 2>&1; then
+#   if command -v pgbackrest >/dev/null 2>&1; then
+#     echo "  [ok] pgbackrest already installed ($(pgbackrest version 2>/dev/null | head -1 || echo present))"
+#   else
+#     if $DRY_RUN; then
+#       echo "  [dry-run] apt-get install -y pgbackrest"
+#     else
+#       echo "  Installing pgbackrest..."
+#       export DEBIAN_FRONTEND=noninteractive
+#       apt-get update -qq
+#       if apt-get install -y pgbackrest; then
+#         echo "  [ok] pgbackrest installed"
+#       else
+#         echo "  WARNING: could not install pgbackrest (optional for cluster backups)"
+#       fi
+#     fi
+#   fi
+# else
+#   echo "  (apt-get not available — skipping package installs)"
+# fi
 
 # =============================================================================
 # 7. Local PostgreSQL for CDC (wal2json + wal_level=logical)

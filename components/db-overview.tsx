@@ -5,12 +5,10 @@ import Link from "next/link"
 import {
   DatabaseIcon,
   HardDriveDownloadIcon,
-  TimerIcon,
   ActivityIcon,
   ArrowRightIcon,
   ServerIcon,
   RadioIcon,
-  AlertCircleIcon,
   CheckCircle2Icon,
   XCircleIcon,
 } from "lucide-react"
@@ -25,8 +23,7 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { useDb } from "@/lib/db-context"
-import { listCronJobs, startCdcDaemon } from "@/lib/api"
-import type { CdcDbStatus } from "@/lib/api"
+import { startCdcDaemon } from "@/lib/api"
 import { toast } from "sonner"
 
 function statusBadge(status: string) {
@@ -39,11 +36,8 @@ function statusBadge(status: string) {
 
 export function DbStats() {
   const { servers, backups } = useDb()
-  const [cronCount, setCronCount] = React.useState(0)
 
-  React.useEffect(() => {
-    listCronJobs().then((jobs) => setCronCount(jobs.length)).catch(() => setCronCount(0))
-  }, [])
+  const totalDbs = servers.reduce((sum, s) => sum + s.databases.length, 0)
 
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -56,17 +50,17 @@ export function DbStats() {
       </Card>
       <Card className="shadow-none">
         <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+          <CardDescription className="text-xs font-medium">Databases</CardDescription>
+          <DatabaseIcon className="size-4 text-muted-foreground" />
+        </CardHeader>
+        <CardTitle className="px-6 pb-6 text-2xl">{totalDbs}</CardTitle>
+      </Card>
+      <Card className="shadow-none">
+        <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
           <CardDescription className="text-xs font-medium">Total backups</CardDescription>
           <HardDriveDownloadIcon className="size-4 text-muted-foreground" />
         </CardHeader>
         <CardTitle className="px-6 pb-6 text-2xl">{backups.length}</CardTitle>
-      </Card>
-      <Card className="shadow-none">
-        <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
-          <CardDescription className="text-xs font-medium">Active cron jobs</CardDescription>
-          <TimerIcon className="size-4 text-muted-foreground" />
-        </CardHeader>
-        <CardTitle className="px-6 pb-6 text-2xl">{cronCount}</CardTitle>
       </Card>
       <Card className="shadow-none">
         <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
@@ -83,10 +77,6 @@ export function DbStats() {
 
 export function DbDatabases() {
   const { servers } = useDb()
-
-  const allDbs = servers.flatMap((s) =>
-    s.databases.map((db) => ({ server: s.label, engine: s.engine, db }))
-  )
 
   return (
     <Card className="shadow-none">
@@ -143,8 +133,8 @@ export function DbRecentBackups() {
           <CardTitle className="text-sm font-semibold">Recent backups</CardTitle>
           <CardDescription>Latest backup activity across all databases.</CardDescription>
         </div>
-        <Button variant="ghost" size="sm" nativeButton={false} render={<Link href="/restore" />}>
-          Restore <ArrowRightIcon className="ml-1 size-3" />
+        <Button variant="ghost" size="sm" nativeButton={false} render={<Link href="/databases" />}>
+          Databases <ArrowRightIcon className="ml-1 size-3" />
         </Button>
       </CardHeader>
       <CardContent className="px-0">

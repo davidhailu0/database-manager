@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { isLocalHost, isRemoteConnection, getSshHost, buildStanzaEntries } from '../app/api/[[...route]]/route'
+import { isLocalHost, isRemoteConnection, getSshHost } from '../app/api/[[...route]]/route'
 
 describe('isLocalHost', () => {
   it('returns true for localhost', () => {
@@ -100,51 +100,51 @@ describe('getSshHost', () => {
   })
 })
 
-describe('buildStanzaEntries', () => {
-  const pgDataDir = '/var/lib/postgresql/15/main'
-
-  it('returns only pg1-path for local connections', () => {
-    const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@localhost:5432/mydb')
-    expect(entries).toEqual([{ key: 'pg1-path', value: pgDataDir }])
-  })
-
-  it('returns only pg1-path for 127.0.0.1', () => {
-    const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@127.0.0.1:5432/mydb')
-    expect(entries).toEqual([{ key: 'pg1-path', value: pgDataDir }])
-  })
-
-  it('returns only pg1-path for Unix socket', () => {
-    const entries = buildStanzaEntries(pgDataDir, 'postgresql:///mydb')
-    expect(entries).toEqual([{ key: 'pg1-path', value: pgDataDir }])
-  })
-
-  it('includes pg1-host, pg1-user, pg1-port for remote connections', () => {
-    const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@db.example.com:5432/mydb')
-    expect(entries).toEqual([
-      { key: 'pg1-host', value: 'db.example.com' },
-      { key: 'pg1-user', value: 'postgres' },
-      { key: 'pg1-port', value: '5432' },
-      { key: 'pg1-path', value: pgDataDir },
-    ])
-  })
-
-  it('uses custom port for remote connections', () => {
-    const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@192.168.1.100:6543/mydb')
-    expect(entries).toEqual([
-      { key: 'pg1-host', value: '192.168.1.100' },
-      { key: 'pg1-user', value: 'postgres' },
-      { key: 'pg1-port', value: '6543' },
-      { key: 'pg1-path', value: pgDataDir },
-    ])
-  })
-
-  it('defaults port to 5432 when not specified', () => {
-    const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@db.example.com/mydb')
-    expect(entries.find(e => e.key === 'pg1-port')?.value).toBe('5432')
-  })
-
-  it('falls back to local-only config for invalid URLs', () => {
-    const entries = buildStanzaEntries(pgDataDir, 'not-a-url')
-    expect(entries).toEqual([{ key: 'pg1-path', value: pgDataDir }])
-  })
-})
+// describe('buildStanzaEntries', () => {
+//   const pgDataDir = '/var/lib/postgresql/15/main'
+//
+//   it('returns only pg1-path for local connections', () => {
+//     const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@localhost:5432/mydb')
+//     expect(entries).toEqual([{ key: 'pg1-path', value: pgDataDir }])
+//   })
+//
+//   it('returns only pg1-path for 127.0.0.1', () => {
+//     const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@127.0.0.1:5432/mydb')
+//     expect(entries).toEqual([{ key: 'pg1-path', value: pgDataDir }])
+//   })
+//
+//   it('returns only pg1-path for Unix socket', () => {
+//     const entries = buildStanzaEntries(pgDataDir, 'postgresql:///mydb')
+//     expect(entries).toEqual([{ key: 'pg1-path', value: pgDataDir }])
+//   })
+//
+//   it('includes pg1-host, pg1-user, pg1-port for remote connections', () => {
+//     const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@db.example.com:5432/mydb')
+//     expect(entries).toEqual([
+//       { key: 'pg1-host', value: 'db.example.com' },
+//       { key: 'pg1-user', value: 'postgres' },
+//       { key: 'pg1-port', value: '5432' },
+//       { key: 'pg1-path', value: pgDataDir },
+//     ])
+//   })
+//
+//   it('uses custom port for remote connections', () => {
+//     const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@192.168.1.100:6543/mydb')
+//     expect(entries).toEqual([
+//       { key: 'pg1-host', value: '192.168.1.100' },
+//       { key: 'pg1-user', value: 'postgres' },
+//       { key: 'pg1-port', value: '6543' },
+//       { key: 'pg1-path', value: pgDataDir },
+//     ])
+//   })
+//
+//   it('defaults port to 5432 when not specified', () => {
+//     const entries = buildStanzaEntries(pgDataDir, 'postgresql://user:pass@db.example.com/mydb')
+//     expect(entries.find(e => e.key === 'pg1-port')?.value).toBe('5432')
+//   })
+//
+//   it('falls back to local-only config for invalid URLs', () => {
+//     const entries = buildStanzaEntries(pgDataDir, 'not-a-url')
+//     expect(entries).toEqual([{ key: 'pg1-path', value: pgDataDir }])
+//   })
+// })

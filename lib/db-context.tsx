@@ -1,8 +1,8 @@
 "use client"
 
 import * as React from "react"
-import { listBackups as apiListBackups, getStorageSettings as apiGetStorageSettings, listServers, getCdcStatus, setupCdcForDb as apiSetupCdcForDb } from "@/lib/api"
-import type { ServerRecord, CdcDbStatus } from "@/lib/api"
+import { listBackups as apiListBackups, getStorageSettings as apiGetStorageSettings, listServers, getCdcStatus, setupCdcForDb as apiSetupCdcForDb, listDbConfigs as apiListDbConfigs } from "@/lib/api"
+import type { ServerRecord, CdcDbStatus, DbConfig } from "@/lib/api"
 import { useAuth } from "@/lib/auth-context"
 
 export type Backup = {
@@ -20,12 +20,14 @@ type DbContextValue = {
   backups: Backup[]
   storagePath: string
   retentionDays: number
+  dbConfigs: DbConfig[]
   addBackup: (backup: Backup) => void
   updateBackup: (id: string, updates: Partial<Backup>) => void
   deleteBackup: (id: string) => void
   refreshBackups: () => Promise<void>
   refreshStorageSettings: () => Promise<void>
   refreshServers: () => Promise<void>
+  refreshDbConfigs: () => Promise<void>
   isRestoring: boolean
   setIsRestoring: (v: boolean) => void
   setStoragePath: (path: string) => void
@@ -71,6 +73,7 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
   const [retentionDays, setRetentionDays] = React.useState(30)
   const [servers, setServers] = React.useState<ServerRecord[]>([])
   const [cdcStatuses, setCdcStatuses] = React.useState<CdcDbStatus[]>([])
+  const [dbConfigs, setDbConfigs] = React.useState<DbConfig[]>([])
   const skipBackupsSave = React.useRef(true)
 
   const refreshBackups = React.useCallback(async () => {
@@ -111,6 +114,15 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
+  const refreshDbConfigs = React.useCallback(async () => {
+    try {
+      const api = await apiListDbConfigs()
+      setDbConfigs(api)
+    } catch {
+      setDbConfigs([])
+    }
+  }, [])
+
   const setupCdc = React.useCallback(async (dbName: string) => {
     await apiSetupCdcForDb(dbName)
     await refreshCdcStatus()
@@ -130,6 +142,7 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
     refreshServers()
     refreshBackups()
     refreshCdcStatus()
+    refreshDbConfigs()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token])
 
@@ -159,9 +172,9 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <DbContext.Provider value={{
-      servers, backups, storagePath, retentionDays,
+      servers, backups, storagePath, retentionDays, dbConfigs,
       addBackup, updateBackup, deleteBackup,
-      refreshBackups, refreshStorageSettings, refreshServers,
+      refreshBackups, refreshStorageSettings, refreshServers, refreshDbConfigs,
       isRestoring, setIsRestoring,
       setStoragePath, setRetentionDays,
       cdcStatuses, refreshCdcStatus, setupCdc,

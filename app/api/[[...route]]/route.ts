@@ -225,20 +225,20 @@ export function getSshHost(connectionUrl: string): string | null {
   }
 }
 
-/** Builds pgBackRest stanza config entries — adds pg1-host/pg1-user/pg1-port for remote servers. */
-export function buildStanzaEntries(pgDataDir: string, connectionUrl: string): { key: string; value: string }[] {
-  const entries: { key: string; value: string }[] = []
-  if (isRemoteConnection(connectionUrl)) {
-    try {
-      const u = new URL(connectionUrl)
-      entries.push({ key: 'pg1-host', value: u.hostname })
-      entries.push({ key: 'pg1-user', value: 'postgres' })
-      entries.push({ key: 'pg1-port', value: u.port || '5432' })
-    } catch { /* fall through to local-only config */ }
-  }
-  entries.push({ key: 'pg1-path', value: pgDataDir })
-  return entries
-}
+// /** Builds pgBackRest stanza config entries — adds pg1-host/pg1-user/pg1-port for remote servers. */
+// export function buildStanzaEntries(pgDataDir: string, connectionUrl: string): { key: string; value: string }[] {
+//   const entries: { key: string; value: string }[] = []
+//   if (isRemoteConnection(connectionUrl)) {
+//     try {
+//       const u = new URL(connectionUrl)
+//       entries.push({ key: 'pg1-host', value: u.hostname })
+//       entries.push({ key: 'pg1-user', value: 'postgres' })
+//       entries.push({ key: 'pg1-port', value: u.port || '5432' })
+//     } catch { /* fall through to local-only config */ }
+//   }
+//   entries.push({ key: 'pg1-path', value: pgDataDir })
+//   return entries
+// }
 
 function isValidCronExpression(e: string): boolean {
   try {
@@ -384,6 +384,15 @@ function initDb() {
       status TEXT NOT NULL DEFAULT 'healthy',
       created_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS db_configs (
+      db TEXT PRIMARY KEY,
+      destination_path TEXT NOT NULL DEFAULT '/var/backups/pg',
+      schedule_cron TEXT NOT NULL DEFAULT '0 2 * * *',
+      keep_latest INTEGER NOT NULL DEFAULT 7,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `)
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_checkpoints_db_created ON health_checkpoints(db, created_at)') } catch {}
   // Schema migrations (idempotent)
@@ -392,6 +401,15 @@ function initDb() {
   try { db.exec('ALTER TABLE backups ADD COLUMN created_at_iso TEXT') } catch {}
   try { db.exec('ALTER TABLE servers ADD COLUMN ssh_user TEXT') } catch {}
   seedUsers()
+  // Migrate admin allowed pages/actions to the new page structure
+  try {
+    const adminRow = db.prepare('SELECT * FROM users WHERE id = ?').get('admin_0001') as any
+    if (adminRow) {
+      const newPages = JSON.stringify(['dashboard', 'databases', 'settings', 'users'])
+      const newActions = JSON.stringify(['backup:create', 'backup:delete', 'backup:retry', 'restore:run', 'config:read', 'config:write', 'settings:read', 'settings:write', 'users:manage'])
+      db.prepare('UPDATE users SET allowed_pages = ?, allowed_actions = ? WHERE id = ?').run(newPages, newActions, 'admin_0001')
+    }
+  } catch { /* best-effort */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -513,6 +531,77 @@ function deleteServerById(id: string): number {
   return getDb().prepare('DELETE FROM servers WHERE id = ?').run(id).changes
 }
 
+// ---------------------------------------------------------------------------
+// DbConfig — per-database backup configuration (destination, schedule, retention)
+// ---------------------------------------------------------------------------
+type DbConfig = {
+  db: string
+  destinationPath: string
+  scheduleCron: string
+  keepLatest: number
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+function rowToDbConfig(r: any): DbConfig {
+  return {
+    db: r.db,
+    destinationPath: r.destination_path,
+    scheduleCron: r.schedule_cron,
+    keepLatest: r.keep_latest,
+    enabled: !!r.enabled,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  }
+}
+
+function listDbConfigs(): DbConfig[] {
+  const db = getDb()
+  const rows = db.prepare('SELECT * FROM db_configs').all() as any[]
+  return rows.map(rowToDbConfig)
+}
+
+function getDbConfig(dbName: string): DbConfig | null {
+  const db = getDb()
+  const row = db.prepare('SELECT * FROM db_configs WHERE db = ?').get(dbName) as any
+  return row ? rowToDbConfig(row) : null
+}
+
+function upsertDbConfig(config: DbConfig): void {
+  getDb().prepare(
+    `INSERT INTO db_configs (db, destination_path, schedule_cron, keep_latest, enabled, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(db) DO UPDATE SET
+       destination_path = excluded.destination_path,
+       schedule_cron = excluded.schedule_cron,
+       keep_latest = excluded.keep_latest,
+       enabled = excluded.enabled,
+       updated_at = excluded.updated_at`
+  ).run(config.db, config.destinationPath, config.scheduleCron, config.keepLatest, config.enabled ? 1 : 0, config.createdAt, config.updatedAt)
+}
+
+function deleteDbConfigByName(dbName: string): number {
+  return getDb().prepare('DELETE FROM db_configs WHERE db = ?').run(dbName).changes
+}
+
+/** Enforce keep-latest retention: delete oldest backup records + on-disk files. */
+function enforceRetention(dbName: string): void {
+  const config = getDbConfig(dbName)
+  if (!config) return
+  const db = getDb()
+  const rows = db.prepare('SELECT * FROM backups WHERE db = ? AND source = ? AND status = ? ORDER BY created_at_iso DESC').all(dbName, 'cdc', 'Completed') as any[]
+  if (rows.length <= config.keepLatest) return
+  const toDelete = rows.slice(config.keepLatest)
+  for (const row of toDelete) {
+    const backup = rowToBackup(row)
+    if (backup.path) {
+      try { fs.unlinkSync(backup.path) } catch { /* best-effort */ }
+    }
+    deleteBackupById(backup.id)
+  }
+}
+
 function rowToUser(r: any): AppUser {
   return {
     id: r.id,
@@ -565,27 +654,27 @@ function isoStamp() {
   return new Date().toISOString()
 }
 
-async function fetchBackupSize(stanza: string): Promise<string> {
-  try {
-    const { stdout } = await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, '--output=json', 'info'])
-    const info = JSON.parse(stdout)
-    const latest = info[0]?.backup?.at(-1)?.backup
-    if (latest) {
-      const bytes: number = latest.backup_size ?? latest.size ?? 0
-      if (bytes > 0) {
-        const gb = bytes / 1073741824
-        if (gb >= 1) return `${gb.toFixed(1)} GB`
-        const mb = bytes / 1048576
-        return `${Math.round(mb)} MB`
-      }
-      return '—' // no bytes recorded
-    }
-    return '—' // no backups listed
-  } catch (err: unknown) {
-    console.warn('[fetchBackupSize] parse failed for stanza', stanza, err instanceof Error ? err.message : err)
-    return '—'
-  }
-}
+// async function fetchBackupSize(stanza: string): Promise<string> {
+//   try {
+//     const { stdout } = await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, '--output=json', 'info'])
+//     const info = JSON.parse(stdout)
+//     const latest = info[0]?.backup?.at(-1)?.backup
+//     if (latest) {
+//       const bytes: number = latest.backup_size ?? latest.size ?? 0
+//       if (bytes > 0) {
+//         const gb = bytes / 1073741824
+//         if (gb >= 1) return `${gb.toFixed(1)} GB`
+//         const mb = bytes / 1048576
+//         return `${Math.round(mb)} MB`
+//       }
+//       return '—' // no bytes recorded
+//     }
+//     return '—' // no backups listed
+//   } catch (err: unknown) {
+//     console.warn('[fetchBackupSize] parse failed for stanza', stanza, err instanceof Error ? err.message : err)
+//     return '—'
+//   }
+// }
 
 // ---------------------------------------------------------------------------
 // 1. Databases — list databases from a connection URL
@@ -652,143 +741,166 @@ app.post('/databases', async (c) => {
 // ---------------------------------------------------------------------------
 // 2. Backup — run pgBackRest backup for a stanza/database
 // ---------------------------------------------------------------------------
-app.post('/backup', async (c) => {
-  try {
-    const user = requireAuth(c)
-    if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
-
-    const { stanza, type = 'Full' } = await c.req.json()
-
-    if (!stanza) {
-      return errJson(c, 'Stanza (server label) is required', 400)
-    }
-    if (!isValidStanza(stanza)) {
-      return errJson(c, 'Stanza name must match /^[a-z0-9_-]+$/i (max 64 chars)', 400)
-    }
-
-    const backupType: 'Full' | 'Incremental' = type === 'Incremental' ? 'Incremental' : 'Full'
-
-    // Record a "Running" entry immediately
-    const id = 'bkp_' + randomUUID().slice(0, 8)
-    const nowIso = isoStamp()
-    const record: BackupRecord = {
-      id,
-      db: stanza,
-      type: backupType,
-      size: '—',
-      createdAt: nowStamp(),
-      createdAtIso: nowIso,
-      status: 'Running',
-      source: 'pgbackrest',
-    }
-    insertBackup(record)
-
-    // Execute pgBackRest. Falls back to a simulated success if the binary is
-    // unavailable (e.g. in dev without pgBackRest installed).
-    try {
-      const args = ['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'backup']
-      if (backupType === 'Incremental') args.push('--type=incr')
-      const { stdout } = await sudoExec(args, { timeout: 120_000 })
-      // Expire old backups + prune WAL only after a FULL backup.
-      // Incremental backups depend on the preceding full backup, so we
-      // must not expire anything until the next full backup completes.
-      if (backupType === 'Full') {
-        await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'expire'], { timeout: 30_000 }).catch(() => {})
-      }
-      const size = await fetchBackupSize(stanza)
-      const path = `/var/lib/pgbackrest/${stanza}/${id}`
-      updateBackupById(id, { status: 'Completed', size, path })
-      const completed = { ...record, status: 'Completed' as const, size, path }
-      return c.json({ success: true, id, message: 'Backup completed', output: stdout, backup: completed })
-    } catch (execError: unknown) {
-      const path = `/var/lib/pgbackrest/${stanza}/${id}`
-      updateBackupById(id, { status: 'Failed', size: '—', path })
-      // Surface pgBackRest's actual output (stdout/stderr) — the execFile
-      // .message is just "Command failed: ..." which is useless for debugging.
-      const errDetail = execError instanceof Error ? execError.message : ''
-      const errStdout = String((execError as { stdout?: string | Buffer }).stdout ?? '').trim()
-      const errStderr = String((execError as { stderr?: string | Buffer }).stderr ?? '').trim()
-      const detail = [errStdout, errStderr, errDetail].filter(Boolean).join('\n')
-      const failed = { ...record, status: 'Failed' as const, size: '—' as const, path }
-      return c.json({
-        success: false,
-        id,
-        error: 'Backup execution failed',
-        message: 'Backup failed — pgBackRest did not complete',
-        details: detail,
-        backup: failed,
-      }, 500)
-    }
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error)
-    return c.json({ success: false, error: 'Backup failed', details: message }, 500)
-  }
-})
+// app.post('/backup', async (c) => {
+//   try {
+//     const user = requireAuth(c)
+//     if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
+//
+//     const { stanza, type = 'Full' } = await c.req.json()
+//
+//     if (!stanza) {
+//       return errJson(c, 'Stanza (server label) is required', 400)
+//     }
+//     if (!isValidStanza(stanza)) {
+//       return errJson(c, 'Stanza name must match /^[a-z0-9_-]+$/i (max 64 chars)', 400)
+//     }
+//
+//     const backupType: 'Full' | 'Incremental' = type === 'Incremental' ? 'Incremental' : 'Full'
+//
+//     // Record a "Running" entry immediately
+//     const id = 'bkp_' + randomUUID().slice(0, 8)
+//     const nowIso = isoStamp()
+//     const record: BackupRecord = {
+//       id,
+//       db: stanza,
+//       type: backupType,
+//       size: '—',
+//       createdAt: nowStamp(),
+//       createdAtIso: nowIso,
+//       status: 'Running',
+//       source: 'pgbackrest',
+//     }
+//     insertBackup(record)
+//
+//     // Execute pgBackRest. Falls back to a simulated success if the binary is
+//     // unavailable (e.g. in dev without pgBackRest installed).
+//     try {
+//       const args = ['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'backup']
+//       if (backupType === 'Incremental') args.push('--type=incr')
+//       const { stdout } = await sudoExec(args, { timeout: 120_000 })
+//       // Expire old backups + prune WAL only after a FULL backup.
+//       // Incremental backups depend on the preceding full backup, so we
+//       // must not expire anything until the next full backup completes.
+//       if (backupType === 'Full') {
+//         await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'expire'], { timeout: 30_000 }).catch(() => {})
+//       }
+//       const size = await fetchBackupSize(stanza)
+//       const path = `/var/lib/pgbackrest/${stanza}/${id}`
+//       updateBackupById(id, { status: 'Completed', size, path })
+//       const completed = { ...record, status: 'Completed' as const, size, path }
+//       return c.json({ success: true, id, message: 'Backup completed', output: stdout, backup: completed })
+//     } catch (execError: unknown) {
+//       const path = `/var/lib/pgbackrest/${stanza}/${id}`
+//       updateBackupById(id, { status: 'Failed', size: '—', path })
+//       // Surface pgBackRest's actual output (stdout/stderr) — the execFile
+//       // .message is just "Command failed: ..." which is useless for debugging.
+//       const errDetail = execError instanceof Error ? execError.message : ''
+//       const errStdout = String((execError as { stdout?: string | Buffer }).stdout ?? '').trim()
+//       const errStderr = String((execError as { stderr?: string | Buffer }).stderr ?? '').trim()
+//       const detail = [errStdout, errStderr, errDetail].filter(Boolean).join('\n')
+//       const failed = { ...record, status: 'Failed' as const, size: '—' as const, path }
+//       return c.json({
+//         success: false,
+//         id,
+//         error: 'Backup execution failed',
+//         message: 'Backup failed — pgBackRest did not complete',
+//         details: detail,
+//         backup: failed,
+//       }, 500)
+//     }
+//   } catch (error: unknown) {
+//     const message = error instanceof Error ? error.message : String(error)
+//     return c.json({ success: false, error: 'Backup failed', details: message }, 500)
+//   }
+// })
 
 // ---------------------------------------------------------------------------
-// 3. Restore — restore from a backup snapshot
+// 3. Restore — restore a CDC backup dump via pg_restore with flags
 // ---------------------------------------------------------------------------
 app.post('/restore', async (c) => {
   try {
     const user = requireAuth(c)
     if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
 
-    const { snapshotId } = await c.req.json()
+    const { snapshotId, targetDb, dataOnly, createDb, schemaOnly, clean } = await c.req.json()
 
     if (!snapshotId) {
-      return c.json({ error: 'Snapshot ID is required' }, 400)
+      return errJson(c, 'Snapshot ID is required', 400)
     }
 
     const all = listBackups()
     const snapshot = all.find((b) => b.id === snapshotId)
     if (!snapshot) {
-      return c.json({ error: 'Snapshot not found' }, 404)
+      return errJson(c, 'Snapshot not found', 404)
     }
     if (snapshot.status !== 'Completed') {
-      return c.json({ error: 'Only completed backups can be restored' }, 400)
+      return errJson(c, 'Only completed backups can be restored', 400)
+    }
+    if (!snapshot.path || !fs.existsSync(snapshot.path)) {
+      return errJson(c, 'Backup file not found on disk', 404)
     }
 
-    const stanza = snapshot.db
-
-    // Derive PostgreSQL cluster unit from stanza's pg1-path
-    // Path format: /var/lib/postgresql/<version>/<cluster>
-    let pgUnit = 'postgresql'
-    try {
-      const raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8')
-      const config = parseIni(raw)
-      const stanzaConfig = config[stanza]
-      if (stanzaConfig) {
-        const pathEntry = stanzaConfig.find(p => p.key === 'pg1-path')
-        if (pathEntry) {
-          const parts = pathEntry.value.match(/\/var\/lib\/postgresql\/(\d+)\/(.+)/)
-          if (parts) {
-            pgUnit = `postgresql@${parts[1]}-${parts[2]}`
-          }
-        }
-      }
-    } catch {
-      // fall back to 'postgresql'
+    const sourceDb = snapshot.db
+    const destDb = (targetDb && isValidDbName(targetDb)) ? targetDb : sourceDb
+    if (!isValidDbName(sourceDb)) {
+      return errJson(c, 'Invalid source database name in backup record', 400)
     }
 
-    // Stop PostgreSQL, run restore, then start PostgreSQL
-    try {
-      await sudoExec(['systemctl', 'stop', pgUnit], { timeout: 60_000 })
-    } catch {
-      return c.json({ success: false, error: 'Failed to stop PostgreSQL' }, 500)
+    // Find the server connection URL for this database
+    const servers = listServers()
+    const server = servers.find((s) => s.databases.includes(sourceDb))
+    if (!server) {
+      return errJson(c, `No server found for database "${sourceDb}"`, 404)
     }
 
+    let pgHost = 'localhost'
+    let pgPort = '5432'
+    let pgUser = 'postgres'
+    let pgPassword = ''
     try {
-      const { stdout } = await sudoExec([
-        '-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, '--delta', 'restore',
-      ], { timeout: 300_000 })
+      const u = new URL(server.connectionUrl)
+      pgHost = u.hostname
+      pgPort = u.port || '5432'
+      pgUser = u.username || 'postgres'
+      pgPassword = u.password || ''
+    } catch { /* fall back to defaults */ }
 
-      // Best-effort restart; await so the client knows the cluster is back up
-      await sudoExec(['systemctl', 'start', pgUnit], { timeout: 60_000 }).catch(() => {})
-      return c.json({ success: true, message: 'Restore completed', output: stdout })
+    // Build pg_restore arguments
+    const restoreArgs: string[] = [
+      '-h', pgHost,
+      '-p', pgPort,
+      '-U', pgUser,
+      '--no-owner',
+      '--no-privileges',
+    ]
+
+    if (dataOnly) restoreArgs.push('--data-only')
+    if (schemaOnly) restoreArgs.push('--schema-only')
+    if (clean) restoreArgs.push('--clean')
+    if (createDb) {
+      restoreArgs.push('--create-db')
+      // With --create-db, connect to the 'postgres' maintenance DB
+      restoreArgs.push('-d', 'postgres')
+    } else {
+      restoreArgs.push('-d', destDb)
+    }
+
+    restoreArgs.push(snapshot.path)
+
+    const psqlEnv = { ...process.env, PGPASSWORD: pgPassword }
+
+    try {
+      const { stdout, stderr } = await execFileAsync('pg_restore', restoreArgs, {
+        env: psqlEnv,
+        timeout: 3600_000,
+      })
+      const output = (stdout + stderr).trim()
+      return c.json({
+        success: true,
+        message: `Restore completed — "${sourceDb}" → "${destDb}"`,
+        output,
+      })
     } catch (execError: unknown) {
-      // Attempt to restart PostgreSQL even on restore failure — await so the
-      // client knows the cluster state before issuing the next request.
-      await sudoExec(['systemctl', 'start', pgUnit], { timeout: 60_000 }).catch(() => {})
       const errDetail = execError instanceof Error ? execError.message : ''
       const errStdout = String((execError as { stdout?: string | Buffer }).stdout ?? '').trim()
       const errStderr = String((execError as { stderr?: string | Buffer }).stderr ?? '').trim()
@@ -796,7 +908,7 @@ app.post('/restore', async (c) => {
       return c.json({
         success: false,
         error: 'Restore execution failed',
-        message: 'Restore failed — pgBackRest did not complete',
+        message: 'Restore failed — pg_restore did not complete',
         details: detail,
       }, 500)
     }
@@ -930,45 +1042,48 @@ async function runCronBackup(job: CronJobRecord): Promise<string> {
         }
       } catch { /* best-effort */ }
       updateBackupById(backupId, { status: 'Completed', size, path })
+      try { enforceRetention(job.db) } catch { /* best-effort */ }
     } catch (err: unknown) {
       console.error('[runCronBackup] cdc backup failed for', job.db, err instanceof Error ? err.message : err)
       updateBackupById(backupId, { status: 'Failed', size: '—' })
     }
   } else {
-    // pgBackRest cluster backup — job.db stores the stanza (server label)
-    const stanza = job.db
-    if (!isValidStanza(stanza)) {
-      console.error('[runCronBackup] invalid pgBackRest stanza:', stanza)
-      throw new Error(`Invalid stanza for pgBackRest backup: ${stanza || '(empty)'}`)
-    }
-    backupId = 'bkp_' + randomUUID().slice(0, 8)
-    const backupType: 'Full' | 'Incremental' = dayOfWeek === 0 ? 'Full' : 'Incremental'
-
-    const record: BackupRecord = {
-      id: backupId, db: stanza, type: backupType,
-      size: '—', createdAt: nowStamp(), createdAtIso: isoStamp(), status: 'Running', source: 'pgbackrest',
-    }
-    insertBackup(record)
-
-    try {
-      const args = ['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'backup']
-      if (backupType === 'Incremental') args.push('--type=incr')
-      await sudoExec(args, { timeout: 120_000 })
-      // Expire old backups + prune WAL only after a FULL backup.
-      // Incremental backups depend on the preceding full backup, so we
-      // must not expire anything until the next full backup completes.
-      if (backupType === 'Full') {
-        await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'expire'], { timeout: 30_000 }).catch(() => {})
-      }
-      const size = await fetchBackupSize(stanza)
-      const path = `/var/lib/pgbackrest/${stanza}/${backupId}`
-      updateBackupById(backupId, { status: 'Completed', size, path })
-    } catch (err: unknown) {
-      console.error('[runCronBackup] pgbackrest backup failed for', stanza, err instanceof Error ? err.message : err)
-      const path = `/var/lib/pgbackrest/${stanza}/${backupId}`
-      updateBackupById(backupId, { status: 'Failed', size: '—', path })
-    }
+    throw new Error(`Unsupported backup source: ${job.source}. Only CDC is supported.`)
   }
+  // } else {
+  //   // pgBackRest cluster backup — job.db stores the stanza (server label)
+  //   const stanza = job.db
+  //   if (!isValidStanza(stanza)) {
+  //     console.error('[runCronBackup] invalid pgBackRest stanza:', stanza)
+  //     throw new Error(`Invalid stanza for pgBackRest backup: ${stanza || '(empty)'}`)
+  //   }
+  //   backupId = 'bkp_' + randomUUID().slice(0, 8)
+  //   const backupType: 'Full' | 'Incremental' = dayOfWeek === 0 ? 'Full' : 'Incremental'
+  //
+  //   const record: BackupRecord = {
+  //     id: backupId, db: stanza, type: backupType,
+  //     size: '—', createdAt: nowStamp(), createdAtIso: isoStamp(), status: 'Running', source: 'pgbackrest',
+  //   }
+  //   insertBackup(record)
+  //
+  //   try {
+  //     const args = ['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'backup']
+  //     if (backupType === 'Incremental') args.push('--type=incr')
+  //     await sudoExec(args, { timeout: 120_000 })
+  //     // Expire old backups + prune WAL only after a FULL backup.
+  //     // Incremental backups depend on the preceding full backup, so we
+  //     // must not expire anything until the next full backup completes.
+  //     if (backupType === 'Full') {
+  //       await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'expire'], { timeout: 30_000 }).catch(() => {})
+  //     }
+  //     const size = await fetchBackupSize(stanza)
+  //     const path = `/var/lib/pgbackrest/${stanza}/${backupId}`
+  //     updateBackupById(backupId, { status: 'Completed', size, path })
+  //   } catch (err: unknown) {
+  //     console.error('[runCronBackup] pgbackrest backup failed for', stanza, err instanceof Error ? err.message : err)
+  //     const path = `/var/lib/pgbackrest/${stanza}/${backupId}`
+  //     updateBackupById(backupId, { status: 'Failed', size: '—', path })
+  //   }
 
   updateCronJobById(job.id, { lastRun: nowStamp(), nextRun: 'Pending' })
   return backupId
@@ -994,7 +1109,7 @@ app.post('/cron', async (c) => {
     const user = requireAuth(c)
     if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
 
-    const { name, db: rawDb, expression, enabled = true, source = 'pgbackrest' } = await c.req.json()
+    const { name, db: rawDb, expression, enabled = true, source = 'cdc' } = await c.req.json()
 
     if (!name || !expression) {
       return errJson(c, 'name and expression are required', 400)
@@ -1002,18 +1117,16 @@ app.post('/cron', async (c) => {
     if (!isValidCronExpression(expression)) {
       return errJson(c, 'Invalid cron expression', 400)
     }
-    if (source !== 'pgbackrest' && source !== 'cdc') {
-      return errJson(c, 'source must be "pgbackrest" or "cdc"', 400)
-    }
+    // if (source !== 'pgbackrest' && source !== 'cdc') {
+    //   return errJson(c, 'source must be "pgbackrest" or "cdc"', 400)
+    // }
     // For pgBackRest, `db` is the stanza (server label). For CDC, `db` is the database name.
     if (!rawDb || typeof rawDb !== 'string') {
-      return errJson(c, source === 'cdc'
-        ? 'db is required for CDC backups'
-        : 'db (stanza / server label) is required for pgBackRest backups', 400)
+      return errJson(c, 'db is required for CDC backups', 400)
     }
-    if (source === 'pgbackrest' && !isValidStanza(rawDb)) {
-      return errJson(c, 'db must be a valid stanza name (/^[a-z0-9_-]+$/i, max 64)', 400)
-    }
+    // if (source === 'pgbackrest' && !isValidStanza(rawDb)) {
+    //   return errJson(c, 'db must be a valid stanza name (/^[a-z0-9_-]+$/i, max 64)', 400)
+    // }
     if (source === 'cdc' && !isValidDbName(rawDb)) {
       return errJson(c, 'db must be a valid PostgreSQL identifier (max 63 chars)', 400)
     }
@@ -1029,7 +1142,7 @@ app.post('/cron', async (c) => {
       lastRun: '—',
       nextRun: 'Pending',
       createdAt: new Date().toISOString().slice(0, 10),
-      source: source === 'cdc' ? 'cdc' : 'pgbackrest',
+      source: 'cdc',
     }
     insertCronJob(record)
     scheduleCronJob(record)
@@ -1139,77 +1252,274 @@ app.post('/settings/storage', async (c) => {
 })
 
 // ---------------------------------------------------------------------------
+// 6.5. Database configs — per-database backup configuration
+// ---------------------------------------------------------------------------
+app.get('/db-configs', (c) => {
+  const user = requireAuth(c)
+  if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
+  try {
+    const configs = listDbConfigs()
+    return c.json({ success: true, configs })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+app.post('/db-configs', async (c) => {
+  try {
+    const user = requireAuth(c)
+    if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
+
+    const { db, destinationPath, scheduleCron, keepLatest, enabled = true } = await c.req.json()
+
+    if (!db || !isValidDbName(db)) {
+      return errJson(c, 'db is required and must be a valid PostgreSQL identifier', 400)
+    }
+    if (!destinationPath || typeof destinationPath !== 'string') {
+      return errJson(c, 'destinationPath is required', 400)
+    }
+    if (!scheduleCron || !isValidCronExpression(scheduleCron)) {
+      return errJson(c, 'scheduleCron is required and must be a valid cron expression', 400)
+    }
+    const keepNum = Number(keepLatest)
+    if (!Number.isFinite(keepNum) || keepNum < 1 || keepNum > 365) {
+      return errJson(c, 'keepLatest must be a number between 1 and 365', 400)
+    }
+
+    const now = new Date().toISOString()
+    const existing = getDbConfig(db)
+    const config: DbConfig = {
+      db,
+      destinationPath: destinationPath.trim(),
+      scheduleCron: scheduleCron.trim(),
+      keepLatest: Math.floor(keepNum),
+      enabled: !!enabled,
+      createdAt: existing?.createdAt ?? now,
+      updatedAt: now,
+    }
+    upsertDbConfig(config)
+
+    // Auto-manage the corresponding cron job for scheduled backups
+    const cronJobName = `auto-${db}`
+    const existingJobs = listCronJobs()
+    const existingJob = existingJobs.find((j) => j.db === db && j.source === 'cdc')
+    if (config.enabled) {
+      if (existingJob) {
+        updateCronJobById(existingJob.id, { expression: config.scheduleCron, enabled: true })
+        scheduleCronJob({ ...existingJob, expression: config.scheduleCron, enabled: true })
+      } else {
+        const jobId = 'cron_' + randomUUID().slice(0, 8)
+        const record: CronJobRecord = {
+          id: jobId,
+          name: cronJobName,
+          db,
+          expression: config.scheduleCron,
+          enabled: true,
+          lastRun: '—',
+          nextRun: 'Pending',
+          createdAt: now.slice(0, 10),
+          source: 'cdc',
+        }
+        insertCronJob(record)
+        scheduleCronJob(record)
+      }
+    } else {
+      // Disable the cron job if config is disabled
+      if (existingJob) {
+        updateCronJobById(existingJob.id, { enabled: false })
+        unscheduleCronJob(existingJob.id)
+      }
+    }
+
+    return c.json({ success: true, config })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+app.post('/db-configs/delete', async (c) => {
+  try {
+    const user = requireAuth(c)
+    if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
+
+    const { db } = await c.req.json()
+    if (!db) return errJson(c, 'db is required', 400)
+
+    // Remove the associated cron job
+    const existingJobs = listCronJobs()
+    const existingJob = existingJobs.find((j) => j.db === db && j.source === 'cdc')
+    if (existingJob) {
+      unscheduleCronJob(existingJob.id)
+      deleteCronJobById(existingJob.id)
+    }
+
+    const changes = deleteDbConfigByName(db)
+    if (changes === 0) return errJson(c, 'Config not found', 404)
+    return c.json({ success: true, message: `Config for "${db}" deleted` })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    return c.json({ success: false, error: message }, 500)
+  }
+})
+
+// ---------------------------------------------------------------------------
 // 7. pgBackRest config — read / write pgbackrest.conf
 // ---------------------------------------------------------------------------
 
-const PGBACKREST_CONF = process.env.PGBACKREST_CONF || '/etc/pgbackrest/pgbackrest.conf'
+// const PGBACKREST_CONF = process.env.PGBACKREST_CONF || '/etc/pgbackrest/pgbackrest.conf'
 const PGCDC_CONF = process.env.PGCDC_CONF || '/etc/pg-cdc/protected_dbs.yaml'
 
 /**
- * Rudimentary INI parser for pgbackrest.conf.
- * Returns an object where keys are section headers ("global", "stanza_name")
- * and values are arrays of { key, value } pairs (preserving order).
+ * Sanitize the CDC YAML config by removing duplicate mapping keys within
+ * database entries.  js-yaml rejects duplicate keys, but the config file
+ * can accumulate them when entries are edited or appended multiple times.
+ * This function parses the YAML line-by-line and keeps only the first
+ * occurrence of each key inside a `  - name: ...` block.
  */
-function parseIni(text: string): Record<string, { key: string; value: string }[]> {
-  const result: Record<string, { key: string; value: string }[]> = {}
-  let currentSection = 'global'
-  result[currentSection] = []
+function sanitizeCdcConfigYaml(raw: string): string {
+  const lines = raw.split('\n')
+  const out: string[] = []
+  let inDatabases = false
+  let inDbEntry = false
+  let seenKeys = new Set<string>()
 
-  for (const line of text.split('\n')) {
+  for (const line of lines) {
     const trimmed = line.trim()
-    if (!trimmed || trimmed.startsWith('#')) {
-      // preserve blank / comment lines by storing them as null
-      result[currentSection].push({ key: '', value: trimmed })
+
+    // Detect top-level "databases:" key
+    if (/^databases:\s*$/.test(trimmed) && !line.startsWith(' ')) {
+      inDatabases = true
+      inDbEntry = false
+      out.push(line)
       continue
     }
-    const sectionMatch = trimmed.match(/^\[(.+)\]$/)
-    if (sectionMatch) {
-      currentSection = sectionMatch[1]
-      if (!result[currentSection]) result[currentSection] = []
+
+    // Exit databases section on a new top-level key
+    if (inDatabases && line.length > 0 && !line.startsWith(' ') && !line.startsWith('\t') && !line.startsWith('-')) {
+      inDatabases = false
+      inDbEntry = false
+      out.push(line)
       continue
     }
-    const eqIdx = trimmed.indexOf('=')
-    if (eqIdx !== -1) {
-      const key = trimmed.slice(0, eqIdx).trim()
-      const value = trimmed.slice(eqIdx + 1).trim()
-      result[currentSection].push({ key, value })
-    } else {
-      result[currentSection].push({ key: '', value: trimmed })
+
+    if (inDatabases) {
+      // New database entry: "  - name: foo"
+      if (/^\s*-\s*name:/.test(line)) {
+        inDbEntry = true
+        seenKeys = new Set<string>()
+        out.push(line)
+        continue
+      }
+
+      if (inDbEntry) {
+        // Property line inside a db entry — detect "    key:" at 4+ space indent
+        const keyMatch = line.match(/^\s{2,}(\w+):/)
+        if (keyMatch) {
+          const key = keyMatch[1]
+          if (seenKeys.has(key)) {
+            // Skip duplicate key — keep the first occurrence
+            continue
+          }
+          seenKeys.add(key)
+        }
+        // Blank or comment lines are fine
+        out.push(line)
+        continue
+      }
+
+      // Inside databases: but not in an entry (e.g. blank line)
+      out.push(line)
+      continue
     }
+
+    out.push(line)
   }
 
-  return result
+  return out.join('\n')
 }
 
-function serializeIni(sections: Record<string, { key: string; value: string }[]>): string {
-  const lines: string[] = []
-  for (const [section, pairs] of Object.entries(sections)) {
-    if (section !== 'global' && lines.length > 0 && !lines[lines.length-1].startsWith('[')) {
-      lines.push('')
-    }
-    lines.push(`[${section}]`)
-    for (const { key, value } of pairs) {
-      // Skip pure blank-line placeholders (key='' and value='') — they're noise.
-      // Keep comment lines (value starts with '#') and bare tokens.
-      if (key === '' && value === '') continue
-      lines.push(key ? `${key}=${value}` : value)
-    }
+/** Read, sanitize, and write back the CDC config if it has duplicate keys. */
+async function sanitizeCdcConfigFile(): Promise<void> {
+  let raw: string
+  try {
+    raw = fs.readFileSync(PGCDC_CONF, 'utf-8')
+  } catch {
+    return // file doesn't exist yet — nothing to sanitize
   }
-  return lines.join('\n') + '\n'
+  const cleaned = sanitizeCdcConfigYaml(raw)
+  if (cleaned !== raw) {
+    await writeConfigFile(PGCDC_CONF, cleaned)
+    console.warn('[cdc] sanitized duplicate keys in', PGCDC_CONF)
+  }
 }
 
-/** Reject duplicate keys within a section — pgbackrest would reject these. */
-function validateIni(config: Record<string, { key: string; value: string }[]>): string | null {
-  for (const [section, pairs] of Object.entries(config)) {
-    const seen = new Set<string>()
-    for (const { key } of pairs) {
-      if (!key) continue
-      if (seen.has(key)) return `Duplicate key "${key}" in section [${section}]`
-      seen.add(key)
-    }
-  }
-  return null
-}
+// /**
+//  * Rudimentary INI parser for pgbackrest.conf.
+//  * Returns an object where keys are section headers ("global", "stanza_name")
+//  * and values are arrays of { key, value } pairs (preserving order).
+//  */
+// function parseIni(text: string): Record<string, { key: string; value: string }[]> {
+//   const result: Record<string, { key: string; value: string }[]> = {}
+//   let currentSection = 'global'
+//   result[currentSection] = []
+//
+//   for (const line of text.split('\n')) {
+//     const trimmed = line.trim()
+//     if (!trimmed || trimmed.startsWith('#')) {
+//       // preserve blank / comment lines by storing them as null
+//       result[currentSection].push({ key: '', value: trimmed })
+//       continue
+//     }
+//     const sectionMatch = trimmed.match(/^\[(.+)\]$/)
+//     if (sectionMatch) {
+//       currentSection = sectionMatch[1]
+//       if (!result[currentSection]) result[currentSection] = []
+//       continue
+//     }
+//     const eqIdx = trimmed.indexOf('=')
+//     if (eqIdx !== -1) {
+//       const key = trimmed.slice(0, eqIdx).trim()
+//       const value = trimmed.slice(eqIdx + 1).trim()
+//       result[currentSection].push({ key, value })
+//     } else {
+//       result[currentSection].push({ key: '', value: trimmed })
+//     }
+//   }
+//
+//   return result
+// }
+//
+// function serializeIni(sections: Record<string, { key: string; value: string }[]>): string {
+//   const lines: string[] = []
+//   for (const [section, pairs] of Object.entries(sections)) {
+//     if (section !== 'global' && lines.length > 0 && !lines[lines.length-1].startsWith('[')) {
+//       lines.push('')
+//     }
+//     lines.push(`[${section}]`)
+//     for (const { key, value } of pairs) {
+//       // Skip pure blank-line placeholders (key='' and value='') — they're noise.
+//       // Keep comment lines (value starts with '#') and bare tokens.
+//       if (key === '' && value === '') continue
+//       lines.push(key ? `${key}=${value}` : value)
+//     }
+//   }
+//   return lines.join('\n') + '\n'
+// }
+//
+// /** Reject duplicate keys within a section — pgbackrest would reject these. */
+// function validateIni(config: Record<string, { key: string; value: string }[]>): string | null {
+//   for (const [section, pairs] of Object.entries(config)) {
+//     const seen = new Set<string>()
+//     for (const { key } of pairs) {
+//       if (!key) continue
+//       if (seen.has(key)) return `Duplicate key "${key}" in section [${section}]`
+//       seen.add(key)
+//     }
+//   }
+//   return null
+// }
 
 /** Write a file directly, falling back to sudo cp on EACCES/ENOENT. */
 async function writeConfigFile(path: string, content: string): Promise<void> {
@@ -1232,7 +1542,7 @@ async function writeConfigFile(path: string, content: string): Promise<void> {
     }
   }
   // Fallback: write to a temp file and copy via sudo -n
-  const tmpFile = '/tmp/pgbackrest-conf-' + randomUUID().slice(0, 8)
+  const tmpFile = '/tmp/db-mgr-conf-' + randomUUID().slice(0, 8)
   fs.writeFileSync(tmpFile, content, 'utf-8')
   try {
     await sudoExec(['mkdir', '-p', dirname(path)], { timeout: 5_000 }).catch(() => {})
@@ -1242,65 +1552,65 @@ async function writeConfigFile(path: string, content: string): Promise<void> {
   }
 }
 
-app.get('/settings/pgbackrest', async (c) => {
-  const user = requireAuth(c)
-  if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
-  try {
-    let raw = ''
-    try {
-      raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8')
-    } catch {
-      // file doesn't exist yet — return an empty template
-      raw = `[global]\n# repo1-path=/var/lib/pgbackrest\n# repo1-retention-full=2\n# compress-type=zst\n`
-    }
-    const config = parseIni(raw)
-    return c.json({ success: true, config })
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error)
-    return c.json({ success: false, error: message }, 500)
-  }
-})
-
-app.post('/settings/pgbackrest', async (c) => {
-  try {
-    const admin = requireRole(c, 'admin')
-    if (!admin) return c.json({ success: false, error: c.res.status === 403 ? 'Forbidden' : 'Not authenticated' }, c.res.status === 403 ? 403 : 401)
-
-    const { config } = await c.req.json()
-    if (!config || typeof config !== 'object') {
-      return c.json({ error: 'config object is required' }, 400)
-    }
-    const iniError = validateIni(config)
-    if (iniError) return c.json({ error: iniError }, 400)
-
-    const raw = serializeIni(config)
-    await writeConfigFile(PGBACKREST_CONF, raw)
-    return c.json({ success: true, message: 'pgBackRest config saved' })
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error)
-    return c.json({ success: false, error: message }, 500)
-  }
-})
-
-app.post('/stanza-create', async (c) => {
-  try {
-    const admin = requireRole(c, 'admin')
-    if (!admin) return c.json({ success: false, error: c.res.status === 403 ? 'Forbidden' : 'Not authenticated' }, c.res.status === 403 ? 403 : 401)
-
-    const { stanza } = await c.req.json()
-    if (!stanza) {
-      return c.json({ error: 'Stanza name is required' }, 400)
-    }
-    if (!isValidStanza(stanza)) {
-      return c.json({ error: 'Stanza name must match /^[a-z0-9_-]+$/i (max 64 chars)' }, 400)
-    }
-    const { stdout, stderr } = await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'stanza-create'], { timeout: 30_000 })
-    return c.json({ success: true, message: `Stanza "${stanza}" created`, output: stdout || stderr })
-  } catch (error: unknown) {
-    const message = error instanceof Error ? error.message : String(error)
-    return c.json({ success: false, error: `Failed to create stanza: ${message}` }, 500)
-  }
-})
+// app.get('/settings/pgbackrest', async (c) => {
+//   const user = requireAuth(c)
+//   if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
+//   try {
+//     let raw = ''
+//     try {
+//       raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8')
+//     } catch {
+//       // file doesn't exist yet — return an empty template
+//       raw = `[global]\n# repo1-path=/var/lib/pgbackrest\n# repo1-retention-full=2\n# compress-type=zst\n`
+//     }
+//     const config = parseIni(raw)
+//     return c.json({ success: true, config })
+//   } catch (error: unknown) {
+//     const message = error instanceof Error ? error.message : String(error)
+//     return c.json({ success: false, error: message }, 500)
+//   }
+// })
+//
+// app.post('/settings/pgbackrest', async (c) => {
+//   try {
+//     const admin = requireRole(c, 'admin')
+//     if (!admin) return c.json({ success: false, error: c.res.status === 403 ? 'Forbidden' : 'Not authenticated' }, c.res.status === 403 ? 403 : 401)
+//
+//     const { config } = await c.req.json()
+//     if (!config || typeof config !== 'object') {
+//       return c.json({ error: 'config object is required' }, 400)
+//     }
+//     const iniError = validateIni(config)
+//     if (iniError) return c.json({ error: iniError }, 400)
+//
+//     const raw = serializeIni(config)
+//     await writeConfigFile(PGBACKREST_CONF, raw)
+//     return c.json({ success: true, message: 'pgBackRest config saved' })
+//   } catch (error: unknown) {
+//     const message = error instanceof Error ? error.message : String(error)
+//     return c.json({ success: false, error: message }, 500)
+//   }
+// })
+//
+// app.post('/stanza-create', async (c) => {
+//   try {
+//     const admin = requireRole(c, 'admin')
+//     if (!admin) return c.json({ success: false, error: c.res.status === 403 ? 'Forbidden' : 'Not authenticated' }, c.res.status === 403 ? 403 : 401)
+//
+//     const { stanza } = await c.req.json()
+//     if (!stanza) {
+//       return c.json({ error: 'Stanza name is required' }, 400)
+//     }
+//     if (!isValidStanza(stanza)) {
+//       return c.json({ error: 'Stanza name must match /^[a-z0-9_-]+$/i (max 64 chars)' }, 400)
+//     }
+//     const { stdout, stderr } = await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'stanza-create'], { timeout: 30_000 })
+//     return c.json({ success: true, message: `Stanza "${stanza}" created`, output: stdout || stderr })
+//   } catch (error: unknown) {
+//     const message = error instanceof Error ? error.message : String(error)
+//     return c.json({ success: false, error: `Failed to create stanza: ${message}` }, 500)
+//   }
+// })
 
 // ---------------------------------------------------------------------------
 // 8. Servers — multi-server management (replaces single connection URL)
@@ -1388,7 +1698,7 @@ app.post('/servers', async (c) => {
         }
       } catch { /* best-effort */ }
 
-      // Install wal2json and pgBackRest on the remote host
+      // Install wal2json on the remote host
       if (pgMajorVersion) {
         const wal2jsonPkg = `postgresql-${pgMajorVersion}-wal2json`
         try {
@@ -1398,18 +1708,16 @@ app.post('/servers', async (c) => {
           if (!stanzaMessage) stanzaMessage = `Failed to install ${wal2jsonPkg} on remote host — install manually`
         }
       }
-      try {
-        await sudoExec(['apt-get', 'install', '-y', 'pgbackrest'], sshOpts)
-      } catch { /* pgBackRest may already be installed — ignore */ }
+      // try {
+      //   await sudoExec(['apt-get', 'install', '-y', 'pgbackrest'], sshOpts)
+      // } catch { /* pgBackRest may already be installed — ignore */ }
 
       // Create data directories on the remote host and chown to postgres.
       // The CDC daemon runs as User=postgres and writes stream files to
-      // /var/pg-cdc/<db>/.  pgBackRest archive-push (archive_command) runs as
-      // postgres and needs /var/lib/pgbackrest.  Without this chown the
-      // daemon / archive-push fails with EACCES / permission denied.
+      // /var/pg-cdc/<db>/.
       try {
-        await sudoExec(['mkdir', '-p', '/var/pg-cdc', '/var/backups/pg', '/var/log/pg-cdc', '/var/lib/pgbackrest'], sshOpts)
-        await sudoExec(['chown', 'postgres:postgres', '/var/pg-cdc', '/var/backups/pg', '/var/log/pg-cdc', '/var/lib/pgbackrest'], sshOpts)
+        await sudoExec(['mkdir', '-p', '/var/pg-cdc', '/var/backups/pg', '/var/log/pg-cdc'], sshOpts)
+        await sudoExec(['chown', 'postgres:postgres', '/var/pg-cdc', '/var/backups/pg', '/var/log/pg-cdc'], sshOpts)
       } catch { /* best-effort — dirs may already exist */ }
 
       // Set CDC GUCs via ALTER SYSTEM (works over the network)
@@ -1437,128 +1745,128 @@ app.post('/servers', async (c) => {
     }
 
     // Auto-add pgBackRest stanza for this server and run stanza-create
-    if (pgDataDir) {
-      try {
-        let raw = ''
-        try { raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8') } catch { raw = '[global]\n' }
-        const config = parseIni(raw)
-        if (!config[label]) {
-          config[label] = buildStanzaEntries(pgDataDir, connectionUrl)
-          const out = serializeIni(config)
-          await writeConfigFile(PGBACKREST_CONF, out)
-          // Run stanza-create after writing the config
-          try {
-            await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${label}`, 'stanza-create'], { timeout: 30_000 })
-            stanzaCreated = true
-          } catch {
-            stanzaMessage = 'Stanza config written but stanza-create command failed — run it manually'
-          }
-        } else {
-          stanzaMessage = `Stanza "${label}" already exists in config`
-        }
-      } catch (e: unknown) {
-        stanzaMessage = `Failed to write pgBackRest config: ${e instanceof Error ? e.message : String(e)}`
-      }
-
-      // Configure archive_mode=on and archive_command for pgBackRest
-      try {
-        const u = new URL(connectionUrl)
-        if (u.pathname === '/' || u.pathname === '') {
-          u.pathname = '/postgres'
-        }
-        const sql = postgres(u.toString(), { max: 1, idle_timeout: 5 })
-        const desiredArchiveCommand = `pgbackrest --stanza=${label} archive-push %p`
-
-        let needRestart = false
-        let needReload = false
-        try {
-          const amRow = await sql`SHOW archive_mode`
-          const currentArchiveMode = String((amRow[0] as Record<string, string>)?.archive_mode ?? '')
-          if (currentArchiveMode !== 'on') {
-            await sql`ALTER SYSTEM SET archive_mode = 'on'`
-            needRestart = true
-          }
-        } catch (e: unknown) {
-          stanzaMessage = `Failed to set archive_mode: ${e instanceof Error ? e.message : String(e)}`
-        }
-
-        try {
-          const acRow = await sql`SHOW archive_command`
-          const currentArchiveCommand = String((acRow[0] as Record<string, string>)?.archive_command ?? '')
-          if (currentArchiveCommand !== desiredArchiveCommand) {
-            // ALTER SYSTEM SET doesn't support parameterized values ($1) —
-            // use unsafe with a properly escaped string literal.
-            const escapedCmd = desiredArchiveCommand.replace(/'/g, "''")
-            await sql.unsafe(`ALTER SYSTEM SET archive_command = '${escapedCmd}'`)
-            needReload = true
-          }
-        } catch (e: unknown) {
-          stanzaMessage = `Failed to set archive_command: ${e instanceof Error ? e.message : String(e)}`
-        }
-
-        // Reload for SIGHUP parameters (archive_command) — lightweight, no downtime
-        if (needReload && !needRestart) {
-          try {
-            await sql`SELECT pg_reload_conf()`
-          } catch { /* best-effort — restart below will also apply it */ }
-        }
-
-        await sql.end().catch(() => {})
-
-        if (needRestart) {
-          const sshHost = getSshHost(connectionUrl)
-          if (sshHost) {
-            const sshOpts = { timeout: 30_000, host: sshHost, sshUser: sshUser || undefined }
-            let restarted = false
-            try {
-              await sudoExec(['systemctl', 'restart', 'postgresql'], sshOpts)
-              restarted = true
-            } catch { /* best-effort */ }
-            if (!restarted) {
-              try {
-                await sudoExec(['pg_ctlcluster', '--force', 'restart'], sshOpts)
-                restarted = true
-              } catch { /* best-effort */ }
-            }
-            if (!restarted && !stanzaMessage) {
-              stanzaMessage = `archive_mode/archive_command set on remote server "${sshHost}" but could not restart via SSH — restart PostgreSQL there manually`
-            }
-          } else {
-            let restarted = false
-            try {
-              const { stdout } = await execFileAsync('pg_lsclusters', ['--no-header'], { timeout: 5_000 })
-              for (const line of stdout.trim().split('\n')) {
-                const parts = line.trim().split(/\s+/)
-                if (parts.length >= 6 && parts[5] === pgDataDir) {
-                  const ver = parts[0]
-                  await sudoExec(['systemctl', 'restart', `postgresql@${ver}-main`], { timeout: 30_000 })
-                  restarted = true
-                  break
-                }
-              }
-            } catch { /* try fallback */ }
-            if (!restarted) {
-              try {
-                await sudoExec(['systemctl', 'restart', 'postgresql'], { timeout: 30_000 })
-                restarted = true
-              } catch { /* best-effort */ }
-            }
-            if (!restarted && !stanzaMessage) {
-              stanzaMessage = 'archive_mode/archive_command set but PostgreSQL could not be restarted automatically — restart it manually for pgBackRest to work'
-            }
-          }
-        }
-      } catch (e: unknown) {
-        if (!stanzaMessage) {
-          stanzaMessage = `Failed to configure archive_mode/archive_command: ${e instanceof Error ? e.message : String(e)}`
-        }
-      }
-    } else if (engine === 'PostgreSQL') {
-      stanzaMessage =
-        'Could not discover PostgreSQL data directory — stanza not auto-created. ' +
-        'Use a superuser connection URL, or ensure pg_lsclusters is available for local clusters. ' +
-        'You can still create a stanza manually under Settings → pgBackRest.'
-    }
+    // if (pgDataDir) {
+    //   try {
+    //     let raw = ''
+    //     try { raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8') } catch { raw = '[global]\n' }
+    //     const config = parseIni(raw)
+    //     if (!config[label]) {
+    //       config[label] = buildStanzaEntries(pgDataDir, connectionUrl)
+    //       const out = serializeIni(config)
+    //       await writeConfigFile(PGBACKREST_CONF, out)
+    //       // Run stanza-create after writing the config
+    //       try {
+    //         await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${label}`, 'stanza-create'], { timeout: 30_000 })
+    //         stanzaCreated = true
+    //       } catch {
+    //         stanzaMessage = 'Stanza config written but stanza-create command failed — run it manually'
+    //       }
+    //     } else {
+    //       stanzaMessage = `Stanza "${label}" already exists in config`
+    //     }
+    //   } catch (e: unknown) {
+    //     stanzaMessage = `Failed to write pgBackRest config: ${e instanceof Error ? e.message : String(e)}`
+    //   }
+    //
+    //   // Configure archive_mode=on and archive_command for pgBackRest
+    //   try {
+    //     const u = new URL(connectionUrl)
+    //     if (u.pathname === '/' || u.pathname === '') {
+    //       u.pathname = '/postgres'
+    //     }
+    //     const sql = postgres(u.toString(), { max: 1, idle_timeout: 5 })
+    //     const desiredArchiveCommand = `pgbackrest --stanza=${label} archive-push %p`
+    //
+    //     let needRestart = false
+    //     let needReload = false
+    //     try {
+    //       const amRow = await sql`SHOW archive_mode`
+    //       const currentArchiveMode = String((amRow[0] as Record<string, string>)?.archive_mode ?? '')
+    //       if (currentArchiveMode !== 'on') {
+    //         await sql`ALTER SYSTEM SET archive_mode = 'on'`
+    //         needRestart = true
+    //       }
+    //     } catch (e: unknown) {
+    //       stanzaMessage = `Failed to set archive_mode: ${e instanceof Error ? e.message : String(e)}`
+    //     }
+    //
+    //     try {
+    //       const acRow = await sql`SHOW archive_command`
+    //       const currentArchiveCommand = String((acRow[0] as Record<string, string>)?.archive_command ?? '')
+    //       if (currentArchiveCommand !== desiredArchiveCommand) {
+    //         // ALTER SYSTEM SET doesn't support parameterized values ($1) —
+    //         // use unsafe with a properly escaped string literal.
+    //         const escapedCmd = desiredArchiveCommand.replace(/'/g, "''")
+    //         await sql.unsafe(`ALTER SYSTEM SET archive_command = '${escapedCmd}'`)
+    //         needReload = true
+    //       }
+    //     } catch (e: unknown) {
+    //       stanzaMessage = `Failed to set archive_command: ${e instanceof Error ? e.message : String(e)}`
+    //     }
+    //
+    //     // Reload for SIGHUP parameters (archive_command) — lightweight, no downtime
+    //     if (needReload && !needRestart) {
+    //       try {
+    //         await sql`SELECT pg_reload_conf()`
+    //       } catch { /* best-effort — restart below will also apply it */ }
+    //     }
+    //
+    //     await sql.end().catch(() => {})
+    //
+    //     if (needRestart) {
+    //       const sshHost = getSshHost(connectionUrl)
+    //       if (sshHost) {
+    //         const sshOpts = { timeout: 30_000, host: sshHost, sshUser: sshUser || undefined }
+    //         let restarted = false
+    //         try {
+    //           await sudoExec(['systemctl', 'restart', 'postgresql'], sshOpts)
+    //           restarted = true
+    //         } catch { /* best-effort */ }
+    //         if (!restarted) {
+    //           try {
+    //             await sudoExec(['pg_ctlcluster', '--force', 'restart'], sshOpts)
+    //             restarted = true
+    //           } catch { /* best-effort */ }
+    //         }
+    //         if (!restarted && !stanzaMessage) {
+    //           stanzaMessage = `archive_mode/archive_command set on remote server "${sshHost}" but could not restart via SSH — restart PostgreSQL there manually`
+    //         }
+    //       } else {
+    //         let restarted = false
+    //         try {
+    //           const { stdout } = await execFileAsync('pg_lsclusters', ['--no-header'], { timeout: 5_000 })
+    //           for (const line of stdout.trim().split('\n')) {
+    //             const parts = line.trim().split(/\s+/)
+    //             if (parts.length >= 6 && parts[5] === pgDataDir) {
+    //               const ver = parts[0]
+    //               await sudoExec(['systemctl', 'restart', `postgresql@${ver}-main`], { timeout: 30_000 })
+    //               restarted = true
+    //               break
+    //             }
+    //           }
+    //         } catch { /* try fallback */ }
+    //         if (!restarted) {
+    //           try {
+    //             await sudoExec(['systemctl', 'restart', 'postgresql'], { timeout: 30_000 })
+    //             restarted = true
+    //           } catch { /* best-effort */ }
+    //         }
+    //         if (!restarted && !stanzaMessage) {
+    //           stanzaMessage = 'archive_mode/archive_command set but PostgreSQL could not be restarted automatically — restart it manually for pgBackRest to work'
+    //         }
+    //       }
+    //     }
+    //   } catch (e: unknown) {
+    //     if (!stanzaMessage) {
+    //       stanzaMessage = `Failed to configure archive_mode/archive_command: ${e instanceof Error ? e.message : String(e)}`
+    //     }
+    //   }
+    // } else if (engine === 'PostgreSQL') {
+    //   stanzaMessage =
+    //     'Could not discover PostgreSQL data directory — stanza not auto-created. ' +
+    //     'Use a superuser connection URL, or ensure pg_lsclusters is available for local clusters. ' +
+    //     'You can still create a stanza manually under Settings → pgBackRest.'
+    // }
 
     // Auto-create pg-cdc config file so setupCdcForDb works
     if (engine === 'PostgreSQL' && databases.length > 0) {
@@ -1616,6 +1924,8 @@ app.post('/servers', async (c) => {
           }
         }
         // Use writeConfigFile so /etc/pg-cdc is created via sudo when needed
+        // Sanitize to remove any duplicate keys before writing
+        yaml = sanitizeCdcConfigYaml(yaml)
         await writeConfigFile(PGCDC_CONF, yaml)
 
         // Deploy systemd unit files and daemon scripts
@@ -1652,8 +1962,8 @@ app.post('/servers', async (c) => {
         // to /var/pg-cdc/<db>/ and the backup script writes to /var/backups/pg/<db>/.
         // Without this chown the daemon fails with EACCES on stream_current.jsonl.
         try {
-          await sudoExec(['mkdir', '-p', '/var/pg-cdc', '/var/backups/pg', '/var/log/pg-cdc', '/var/lib/pgbackrest'], { timeout: 5000 })
-          await sudoExec(['chown', 'postgres:postgres', '/var/pg-cdc', '/var/backups/pg', '/var/log/pg-cdc', '/var/lib/pgbackrest'], { timeout: 5000 })
+          await sudoExec(['mkdir', '-p', '/var/pg-cdc', '/var/backups/pg', '/var/log/pg-cdc'], { timeout: 5000 })
+          await sudoExec(['chown', 'postgres:postgres', '/var/pg-cdc', '/var/backups/pg', '/var/log/pg-cdc'], { timeout: 5000 })
         } catch { /* best-effort — may already exist with correct owner */ }
 
         // Enable and start the health check timer so it runs automatically
@@ -1744,55 +2054,55 @@ app.post('/servers/delete', async (c) => {
     }
 
     // 3. Remove pgBackRest stanza from config and drop it
-    try {
-      const raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8')
-      const config = parseIni(raw)
-      if (config[server.label]) {
-        delete config[server.label]
-        const out = serializeIni(config)
-        await writeConfigFile(PGBACKREST_CONF, out)
-      }
-    } catch (e: unknown) {
-      if (e instanceof SudoNotConfiguredError) {
-        cleanupErrors.push(e.message)
-      } else {
-        cleanupErrors.push(`Failed to remove pgBackRest stanza: ${e instanceof Error ? e.message : String(e)}`)
-      }
-    }
-    try {
-      await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${server.label}`, 'stanza-drop'], { timeout: 30_000 })
-    } catch { /* stanza may not exist — ignore */ }
+    // try {
+    //   const raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8')
+    //   const config = parseIni(raw)
+    //   if (config[server.label]) {
+    //     delete config[server.label]
+    //     const out = serializeIni(config)
+    //     await writeConfigFile(PGBACKREST_CONF, out)
+    //   }
+    // } catch (e: unknown) {
+    //   if (e instanceof SudoNotConfiguredError) {
+    //     cleanupErrors.push(e.message)
+    //   } else {
+    //     cleanupErrors.push(`Failed to remove pgBackRest stanza: ${e instanceof Error ? e.message : String(e)}`)
+    //   }
+    // }
+    // try {
+    //   await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${server.label}`, 'stanza-drop'], { timeout: 30_000 })
+    // } catch { /* stanza may not exist — ignore */ }
 
     // 3.5. Update or clear archive_command in PostgreSQL
     //      The deleted server's stanza is gone, so archive_command must not
     //      still reference it. Point to a remaining server's stanza or clear it.
-    try {
-      const remainingServers = listServers().filter((s) => s.id !== id)
-      const u = new URL(server.connectionUrl)
-      if (u.pathname === '/' || u.pathname === '') { u.pathname = '/postgres' }
-      const sql = postgres(u.toString(), { max: 1, idle_timeout: 5 })
-      try {
-        if (remainingServers.length > 0) {
-          const newStanza = remainingServers[0].label
-          const newArchiveCommand = `pgbackrest --stanza=${newStanza} archive-push %p`
-          const acRow = await sql`SHOW archive_command`
-          const currentArchiveCommand = String((acRow[0] as Record<string, string>)?.archive_command ?? '')
-          if (currentArchiveCommand !== newArchiveCommand) {
-            const escapedCmd = newArchiveCommand.replace(/'/g, "''")
-            await sql.unsafe(`ALTER SYSTEM SET archive_command = '${escapedCmd}'`)
-            await sql`SELECT pg_reload_conf()`
-          }
-        } else {
-          await sql`ALTER SYSTEM SET archive_command = ''`
-          await sql`SELECT pg_reload_conf()`
-        }
-      } catch (e: unknown) {
-        cleanupErrors.push(`Failed to update archive_command: ${e instanceof Error ? e.message : String(e)}`)
-      }
-      await sql.end().catch(() => {})
-    } catch (e: unknown) {
-      cleanupErrors.push(`Failed to connect for archive_command cleanup: ${e instanceof Error ? e.message : String(e)}`)
-    }
+    // try {
+    //   const remainingServers = listServers().filter((s) => s.id !== id)
+    //   const u = new URL(server.connectionUrl)
+    //   if (u.pathname === '/' || u.pathname === '') { u.pathname = '/postgres' }
+    //   const sql = postgres(u.toString(), { max: 1, idle_timeout: 5 })
+    //   try {
+    //     if (remainingServers.length > 0) {
+    //       const newStanza = remainingServers[0].label
+    //       const newArchiveCommand = `pgbackrest --stanza=${newStanza} archive-push %p`
+    //       const acRow = await sql`SHOW archive_command`
+    //       const currentArchiveCommand = String((acRow[0] as Record<string, string>)?.archive_command ?? '')
+    //       if (currentArchiveCommand !== newArchiveCommand) {
+    //         const escapedCmd = newArchiveCommand.replace(/'/g, "''")
+    //         await sql.unsafe(`ALTER SYSTEM SET archive_command = '${escapedCmd}'`)
+    //         await sql`SELECT pg_reload_conf()`
+    //       }
+    //     } else {
+    //       await sql`ALTER SYSTEM SET archive_command = ''`
+    //       await sql`SELECT pg_reload_conf()`
+    //     }
+    //   } catch (e: unknown) {
+    //     cleanupErrors.push(`Failed to update archive_command: ${e instanceof Error ? e.message : String(e)}`)
+    //   }
+    //   await sql.end().catch(() => {})
+    // } catch (e: unknown) {
+    //   cleanupErrors.push(`Failed to connect for archive_command cleanup: ${e instanceof Error ? e.message : String(e)}`)
+    // }
 
     // 4. Delete associated SQLite records (backups, cron jobs, health checkpoints)
     if (server.databases.length > 0) {
@@ -1967,8 +2277,8 @@ const DEFAULT_ADMIN: AppUser = {
   department: 'IT',
   title: 'Administrator',
   role: 'admin',
-  allowedPages: ['dashboard', 'backup', 'restore', 'cron', 'settings', 'users'],
-  allowedActions: ['backup:create', 'backup:delete', 'backup:retry', 'restore:run', 'cron:create', 'cron:update', 'cron:delete', 'cron:run', 'settings:read', 'settings:write', 'users:manage'],
+  allowedPages: ['dashboard', 'databases', 'settings', 'users'],
+  allowedActions: ['backup:create', 'backup:delete', 'backup:retry', 'restore:run', 'config:read', 'config:write', 'settings:read', 'settings:write', 'users:manage'],
   createdAt: new Date().toISOString(),
 }
 
@@ -1995,32 +2305,40 @@ app.post('/auth/login', async (c) => {
       return c.json({ success: false, error: 'Username and password are required' }, 400)
     }
 
-    // Call AD auth API
-    const adRes = await fetch(AD_AUTH_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email:username, password }),
-    })
-    const adData = await adRes.json()
+    // --- AD auth disabled (server unreachable — expired SSL cert) ---
+    // // Call AD auth API
+    // const adRes = await fetch(AD_AUTH_URL, {
+    //   method: 'POST',
+    //   headers: { 'Content-Type': 'application/json' },
+    //   body: JSON.stringify({ email: username, password }),
+    // })
+    // const adData = await adRes.json()
+    //
+    // if (!adData.success) {
+    //   return c.json({
+    //     success: false,
+    //     error: adData.message || 'Authentication failed',
+    //     details: adData.errors?.reason || 'Invalid credentials',
+    //   }, 401)
+    // }
+    //
+    // // Extract user info from AD response
+    // const adUser = adData.data?.user
+    // if (!adUser?.email) {
+    //   return c.json({ success: false, error: 'AD response missing user data' }, 500)
+    // }
+    //
+    // const localUsers = listUsers()
+    // const authorizedUser = localUsers.find(
+    //   (u) => u.email.toLowerCase() === adUser.email.toLowerCase() || u.samAccountName.toLowerCase() === adUser.sam_account_name?.toLowerCase()
+    // )
 
-    if (!adData.success) {
-      return c.json({
-        success: false,
-        error: adData.message || 'Authentication failed',
-        details: adData.errors?.reason || 'Invalid credentials',
-      }, 401)
-    }
-
-    // Extract user info from AD response
-    const adUser = adData.data?.user
-    if (!adUser?.email) {
-      return c.json({ success: false, error: 'AD response missing user data' }, 500)
-    }
-
+    // --- Temporary: local-only auth — look up user directly in the DB ---
     const localUsers = listUsers()
+    const uname = username.toLowerCase().trim()
     const authorizedUser = localUsers.find(
-      (u) => u.email.toLowerCase() === adUser.email.toLowerCase() || u.samAccountName.toLowerCase() === adUser.sam_account_name?.toLowerCase()
-    )
+      (u) => u.email.toLowerCase() === uname || u.samAccountName.toLowerCase() === uname
+    ) ?? null
 
     if (!authorizedUser) {
       return c.json({
@@ -2234,43 +2552,43 @@ app.post('/users/delete', async (c) => {
 })
 
 // Install system crontab entries for pgbackrest via subprocess
-async function installSystemCronJobs() {
-  const marker = '# pgbackrest-db-manager'
-  const entries = [
-    marker,
-    '# pgBackRest full backup every Sunday 06:30',
-    '30 06 * * 0 pgbackrest --stanza=main --type=full backup',
-    '# pgBackRest incremental backup Mon-Sat 06:30',
-    '30 06 * * 1-6 pgbackrest --stanza=main --type=incr backup',
-    '# pgBackRest archive cron — prune archived WAL no longer needed by retained backups',
-    '*/15 * * * * pgbackrest --stanza=main archive-cron',
-    '# pg-cdc per-db stream & log cleanup (runs hourly, handles retention via PGCDC_RETENTION_DAYS)',
-    '15 * * * * /etc/pg-cdc/cleanup_cdc.sh',
-  ]
-
-  let content: string
-  try {
-    const { stdout } = await sudoExec(['crontab', '-u', 'postgres', '-l'])
-    if (stdout.includes(marker)) return
-    content = (stdout || '') + '\n' + entries.join('\n') + '\n'
-  } catch (err) {
-    if (err instanceof SudoNotConfiguredError) return
-    content = entries.join('\n') + '\n'
-  }
-
-  const tmpFile = '/tmp/pgbackrest-cron-' + randomUUID().slice(0, 8)
-  fs.writeFileSync(tmpFile, content)
-  try {
-    try {
-      await sudoExec(['crontab', '-u', 'postgres', tmpFile])
-    } catch (writeErr: unknown) {
-      if (writeErr instanceof SudoNotConfiguredError) return
-      throw writeErr
-    }
-  } finally {
-    fs.unlinkSync(tmpFile)
-  }
-}
+// async function installSystemCronJobs() {
+//   const marker = '# pgbackrest-db-manager'
+//   const entries = [
+//     marker,
+//     '# pgBackRest full backup every Sunday 06:30',
+//     '30 06 * * 0 pgbackrest --stanza=main --type=full backup',
+//     '# pgBackRest incremental backup Mon-Sat 06:30',
+//     '30 06 * * 1-6 pgbackrest --stanza=main --type=incr backup',
+//     '# pgBackRest archive cron — prune archived WAL no longer needed by retained backups',
+//     '*/15 * * * * pgbackrest --stanza=main archive-cron',
+//     '# pg-cdc per-db stream & log cleanup (runs hourly, handles retention via PGCDC_RETENTION_DAYS)',
+//     '15 * * * * /etc/pg-cdc/cleanup_cdc.sh',
+//   ]
+//
+//   let content: string
+//   try {
+//     const { stdout } = await sudoExec(['crontab', '-u', 'postgres', '-l'])
+//     if (stdout.includes(marker)) return
+//     content = (stdout || '') + '\n' + entries.join('\n') + '\n'
+//   } catch (err) {
+//     if (err instanceof SudoNotConfiguredError) return
+//     content = entries.join('\n') + '\n'
+//   }
+//
+//   const tmpFile = '/tmp/pgbackrest-cron-' + randomUUID().slice(0, 8)
+//   fs.writeFileSync(tmpFile, content)
+//   try {
+//     try {
+//       await sudoExec(['crontab', '-u', 'postgres', tmpFile])
+//     } catch (writeErr: unknown) {
+//       if (writeErr instanceof SudoNotConfiguredError) return
+//       throw writeErr
+//     }
+//   } finally {
+//     fs.unlinkSync(tmpFile)
+//   }
+// }
 
 /**
  * Self-healing: deploy health check systemd units and start the timer if missing.
@@ -2397,6 +2715,10 @@ app.post('/cdc/setup', async (c) => {
     if (!dbName) return errJson(c, 'dbName is required', 400)
     if (!isValidDbName(dbName)) return errJson(c, 'dbName must be a valid PostgreSQL identifier (max 63 chars)', 400)
 
+    // Sanitize the config file before reading/modifying it — removes duplicate
+    // mapping keys that accumulate from repeated edits and cause js-yaml to fail.
+    await sanitizeCdcConfigFile()
+
     // Ensure the database is in the yaml config before running setup
     // Write the db entry to the CDC config file (via sudo if direct write fails)
     async function ensureDbInConfig(): Promise<void> {
@@ -2425,6 +2747,7 @@ app.post('/cdc/setup', async (c) => {
       } else {
         yaml += `databases:\n  - name: ${dbName}\n`
       }
+      yaml = sanitizeCdcConfigYaml(yaml)
       await writeConfigFile(PGCDC_CONF, yaml)
     }
     await ensureDbInConfig()
@@ -2496,6 +2819,9 @@ app.post('/cdc/backup', async (c) => {
         const now = new Date().toISOString()
         dbConn.prepare('INSERT INTO health_checkpoints (id, db, timestamp, wal_lsn, status, created_at) VALUES (?, ?, ?, ?, ?, ?)').run(chkId, dbName, now, '', 'healthy', now)
       } catch { /* best-effort */ }
+
+      // Enforce keep-latest retention
+      try { enforceRetention(dbName) } catch { /* best-effort */ }
 
       const completed = { ...record, status: 'Completed' as const, size, path }
       return c.json({ success: true, id, message: `Baseline backup complete for "${dbName}"`, output: stdout, backup: completed })
@@ -2686,10 +3012,10 @@ app.post('/cdc/health-check', async (c) => {
         const { stdout } = await execFileAsync('sudo', ['-n', 'systemctl', 'is-active', 'pg-cdc-monitor.timer'], { timeout: 3000 })
         if (stdout.trim() !== 'active') { sudoN(['systemctl', 'enable', 'pg-cdc-monitor.timer']); sudoN(['systemctl', 'start', 'pg-cdc-monitor.timer']) }
       } catch { sudoN(['systemctl', 'enable', 'pg-cdc-monitor.timer']); sudoN(['systemctl', 'start', 'pg-cdc-monitor.timer']) }
-      try {
-        const { stdout } = await execFileAsync('sudo', ['-n', 'crontab', '-u', 'postgres', '-l'], { timeout: 3000 })
-        if (!stdout.includes('# pgbackrest-db-manager')) { await installSystemCronJobs().catch(() => {}) }
-      } catch { await installSystemCronJobs().catch(() => {}) }
+      // try {
+      //   const { stdout } = await execFileAsync('sudo', ['-n', 'crontab', '-u', 'postgres', '-l'], { timeout: 3000 })
+      //   if (!stdout.includes('# pgbackrest-db-manager')) { await installSystemCronJobs().catch(() => {}) }
+      // } catch { await installSystemCronJobs().catch(() => {}) }
     })()
 
     // Record checkpoints in SQLite
@@ -2911,29 +3237,29 @@ async function reconcileOrphanedResources(): Promise<ReconcileResult> {
   }
 
   // --- 2. Reconcile pgBackRest config ---
-  try {
-    const raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8')
-    const config = parseIni(raw)
-    const orphanedStanzas = Object.keys(config).filter((s) => s !== 'global' && !knownLabels.has(s))
-    result.orphanedStanzas = orphanedStanzas
-
-    if (orphanedStanzas.length > 0) {
-      for (const stanza of orphanedStanzas) {
-        delete config[stanza]
-        // Best-effort: drop the stanza from pgBackRest
-        try {
-          await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'stanza-drop'], { timeout: 30_000 })
-        } catch { /* stanza may not exist — ignore */ }
-      }
-      const out = serializeIni(config)
-      await writeConfigFile(PGBACKREST_CONF, out)
-      console.warn(`[reconcile] removed ${orphanedStanzas.length} orphaned pgBackRest stanza(s):`, orphanedStanzas)
-    }
-  } catch (e: unknown) {
-    if (!(e instanceof Error && 'code' in e && (e as NodeJS.ErrnoException).code === 'ENOENT')) {
-      result.errors.push(`pgBackRest config reconcile failed: ${e instanceof Error ? e.message : String(e)}`)
-    }
-  }
+  // try {
+  //   const raw = fs.readFileSync(PGBACKREST_CONF, 'utf-8')
+  //   const config = parseIni(raw)
+  //   const orphanedStanzas = Object.keys(config).filter((s) => s !== 'global' && !knownLabels.has(s))
+  //   result.orphanedStanzas = orphanedStanzas
+  //
+  //   if (orphanedStanzas.length > 0) {
+  //     for (const stanza of orphanedStanzas) {
+  //       delete config[stanza]
+  //       // Best-effort: drop the stanza from pgBackRest
+  //       try {
+  //         await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'stanza-drop'], { timeout: 30_000 })
+  //       } catch { /* stanza may not exist — ignore */ }
+  //     }
+  //     const out = serializeIni(config)
+  //     await writeConfigFile(PGBACKREST_CONF, out)
+  //     console.warn(`[reconcile] removed ${orphanedStanzas.length} orphaned pgBackRest stanza(s):`, orphanedStanzas)
+  //   }
+  // } catch (e: unknown) {
+  //   if (!(e instanceof Error && 'code' in e && (e as NodeJS.ErrnoException).code === 'ENOENT')) {
+  //     result.errors.push(`pgBackRest config reconcile failed: ${e instanceof Error ? e.message : String(e)}`)
+  //   }
+  // }
 
   // --- 3. Reconcile systemd pg-cdc@ services ---
   try {
@@ -3030,9 +3356,15 @@ async function reconcileOrphanedResources(): Promise<ReconcileResult> {
 let bootInitialized = false
 if (!bootInitialized) {
   bootInitialized = true
-  installSystemCronJobs().catch((e: unknown) => {
-    console.warn('[boot] installSystemCronJobs failed:', e instanceof Error ? e.message : e)
+
+  // Sanitize the CDC config file on boot — removes duplicate mapping keys
+  sanitizeCdcConfigFile().catch((e: unknown) => {
+    console.warn('[boot] sanitizeCdcConfigFile failed:', e instanceof Error ? e.message : e)
   })
+
+  // installSystemCronJobs().catch((e: unknown) => {
+  //   console.warn('[boot] installSystemCronJobs failed:', e instanceof Error ? e.message : e)
+  // })
 
   // Self-heal: deploy and start the health check timer if missing
   ensureHealthCheckTimer().catch((e: unknown) => {

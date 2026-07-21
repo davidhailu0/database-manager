@@ -19,7 +19,7 @@ export default function DashboardPage() {
         <div>
           <h2 className="text-lg font-semibold tracking-tight">Dashboard</h2>
           <p className="text-sm text-muted-foreground">
-            Manage cluster backups, restores, and scheduled jobs.
+            Monitor database health, backups, and replication status.
           </p>
         </div>
 
@@ -29,40 +29,27 @@ export default function DashboardPage() {
         <div className="grid gap-4 md:grid-cols-2">
           <Card className="shadow-none">
             <CardHeader>
-              <CardTitle className="text-sm font-semibold">Backup</CardTitle>
+              <CardTitle className="text-sm font-semibold">Databases</CardTitle>
               <CardDescription>
-                Create a full or incremental backup of a selected database.
+                View all databases, their health, backups, and restore from snapshots.
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <Button variant="secondary" size="sm" nativeButton={false} render={<Link href="/backup" />}>
-                Backup <ArrowRightIcon className="ml-1 size-3" />
+              <Button variant="secondary" size="sm" nativeButton={false} render={<Link href="/databases" />}>
+                Manage databases <ArrowRightIcon className="ml-1 size-3" />
               </Button>
             </CardContent>
           </Card>
           <Card className="shadow-none">
             <CardHeader>
-              <CardTitle className="text-sm font-semibold">Restore</CardTitle>
+              <CardTitle className="text-sm font-semibold">Settings</CardTitle>
               <CardDescription>
-                Restore an entire cluster from a previous backup snapshot.
+                Configure database servers and discover databases.
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <Button variant="secondary" size="sm" nativeButton={false} render={<Link href="/restore" />}>
-                Restore <ArrowRightIcon className="ml-1 size-3" />
-              </Button>
-            </CardContent>
-          </Card>
-          <Card className="shadow-none">
-            <CardHeader>
-              <CardTitle className="text-sm font-semibold">Schedule Full Backups</CardTitle>
-              <CardDescription>
-                Configure a cron job to run full backups automatically on a schedule.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <Button variant="secondary" size="sm" nativeButton={false} render={<Link href="/cron" />}>
-                Configure <ArrowRightIcon className="ml-1 size-3" />
+              <Button variant="secondary" size="sm" nativeButton={false} render={<Link href="/settings" />}>
+                Settings <ArrowRightIcon className="ml-1 size-3" />
               </Button>
             </CardContent>
           </Card>
