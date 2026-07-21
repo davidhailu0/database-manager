@@ -171,12 +171,11 @@ export async function runPreflightChecks(cfg: PgCdcConfig): Promise<CheckResult[
         status: 'fail',
         message: 'wal2json is not installed',
         fix: [
-          `-- Install wal2json from source or package:`,
-          `# Debian/Ubuntu:`,
-          `sudo apt install postgresql-16-wal2json`,
-          `# or from PGXN:`,
-          `sudo pgxn install wal2json`,
-          `-- Then add to shared_preload_libraries and restart.`,
+          `-- Easiest: full host setup (installs wal2json + sets wal_level):`,
+          `sudo ./scripts/install.sh`,
+          `-- Or package only (Debian/Ubuntu):`,
+          `sudo apt install postgresql-18-wal2json`,
+          `# (match your major version: postgresql-16-wal2json, etc.)`,
         ].join('\n'),
       })
     }

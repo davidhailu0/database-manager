@@ -21,13 +21,14 @@ import { useDb } from "@/lib/db-context"
 import {
   getPgBackRestConfig, savePgBackRestConfig, stanzaCreate,
   createServer, deleteServer, discoverDatabases,
-  setupCdcForDb,
+  setupCdcForDb, isRemoteUrl,
 } from "@/lib/api"
 import type { PgBackRestConfig, ServerRecord } from "@/lib/api"
 
 function AddServerCard({ onAdded }: { onAdded: () => void }) {
   const [label, setLabel] = React.useState("")
   const [url, setUrl] = React.useState("")
+  const [sshUser, setSshUser] = React.useState("")
   const [isAdding, setIsAdding] = React.useState(false)
   const { setupCdc } = useDb()
 
@@ -38,10 +39,11 @@ function AddServerCard({ onAdded }: { onAdded: () => void }) {
     }
     setIsAdding(true)
     try {
-      const result = await createServer(label.trim(), url.trim())
+      const result = await createServer(label.trim(), url.trim(), sshUser.trim() || undefined)
       let stanzaMsg = ''
       if (result.stanzaCreated) stanzaMsg = ' — stanza created'
       else if (result.pgDataDir) stanzaMsg = ' — stanza config added'
+      else if (result.stanzaMessage) stanzaMsg = ` — ${result.stanzaMessage}`
       toast.success(`Server "${label}" added${stanzaMsg}`)
 
       // Auto-setup pg-cdc for discovered PostgreSQL databases
@@ -60,6 +62,7 @@ function AddServerCard({ onAdded }: { onAdded: () => void }) {
 
       setLabel("")
       setUrl("")
+      setSshUser("")
       onAdded()
     } catch (err) {
       toast.error("Failed to add server", {
@@ -81,6 +84,12 @@ function AddServerCard({ onAdded }: { onAdded: () => void }) {
         <Label htmlFor="srv-url" className="text-xs">Connection URL</Label>
         <Input id="srv-url" placeholder="postgresql://user:pass@host:5432" value={url} onChange={(e) => setUrl(e.target.value)} className="font-mono text-sm" />
       </div>
+      {isRemoteUrl(url) && (
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="srv-ssh-user" className="text-xs">SSH username (for remote management)</Label>
+          <Input id="srv-ssh-user" placeholder="e.g. admin, ubuntu" value={sshUser} onChange={(e) => setSshUser(e.target.value)} className="text-sm" />
+        </div>
+      )}
       <div>
         <Button onClick={handleAdd} size="sm" disabled={isAdding}>
           <PlusIcon className="mr-1.5 size-3.5" />

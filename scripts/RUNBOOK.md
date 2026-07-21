@@ -68,10 +68,30 @@ Per-database logical replication backup & point-in-time recovery for PostgreSQL.
 - PostgreSQL cluster with `wal_level = logical`
 - `wal2json` installed and loaded via `shared_preload_libraries`
 - Sufficient `max_replication_slots` and `max_wal_senders`
+- **System install completed once** — creates `/etc/pg-cdc`, deploys units, installs
+  passwordless sudo for the app user, installs `wal2json`, and sets
+  `wal_level=logical` on the local PostgreSQL cluster (restarts Postgres):
+
+```bash
+sudo ./scripts/install.sh
+```
+
+Useful flags:
+
+| Flag | Meaning |
+|------|---------|
+| `--dry-run` | Print actions without changing the system |
+| `--skip-postgres` | Skip wal2json / wal_level (remote-only Postgres) |
+| `--no-restart` | Write GUCs but do not restart PostgreSQL |
+| `--pg-version 18` | Target a specific major version |
+
+Without install, Settings → Add server often fails with either
+`sudo: interactive authentication is required` or
+`logical decoding requires wal_level >= logical`.
 
 ### Steps
 
-1. **Edit config**
+1. **Edit config** (or add the server in the UI — Settings will update this file)
 
 ```bash
 sudo vim /etc/pg-cdc/protected_dbs.yaml

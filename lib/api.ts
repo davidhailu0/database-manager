@@ -25,6 +25,18 @@ export type ServerRecord = {
   connectionUrl: string
   engine: string
   databases: string[]
+  sshUser?: string | null
+}
+
+/** Client-side check: does the connection URL point to a remote (non-local) host? */
+export function isRemoteUrl(url: string): boolean {
+  try {
+    const u = new URL(url)
+    const h = u.hostname.toLowerCase().trim()
+    return h !== '' && h !== 'localhost' && h !== '127.0.0.1' && h !== '::1' && h !== '0.0.0.0' && !h.endsWith('.localhost')
+  } catch {
+    return false
+  }
 }
 
 export type CdcDbStatus = {
@@ -198,8 +210,8 @@ export async function listServers(): Promise<ServerRecord[]> {
   return data.servers
 }
 
-export async function createServer(label: string, connectionUrl: string) {
-  return post<{ server: ServerRecord; pgDataDir?: string; stanzaCreated?: boolean }>("/api/servers", { label, connectionUrl })
+export async function createServer(label: string, connectionUrl: string, sshUser?: string) {
+  return post<{ server: ServerRecord; pgDataDir?: string; stanzaCreated?: boolean; stanzaMessage?: string }>("/api/servers", { label, connectionUrl, sshUser })
 }
 
 export async function deleteServer(id: string) {
@@ -317,4 +329,9 @@ export async function updateUser(token: string, input: {
 
 export async function deleteUser(token: string, id: string) {
   return post<{ message: string }>("/api/users/delete", { id }, { headers: { Authorization: `Bearer ${token}` } })
+}
+
+// System — reconciliation
+export async function reconcileOrphanedResources(token: string) {
+  return post<{ message: string; orphanedCdcDbs: string[]; orphanedStanzas: string[]; orphanedServices: string[]; orphanedSlots: string[]; errors: string[] }>("/api/system/reconcile", {}, { headers: { Authorization: `Bearer ${token}` } })
 }

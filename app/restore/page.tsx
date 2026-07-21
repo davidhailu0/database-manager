@@ -44,7 +44,7 @@ import {
 import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import { useDb } from "@/lib/db-context"
-import { runRestore as apiRunRestore, runCdcRestore, runHealthCheck, getHealthCheckpoints, startCdcDaemon } from "@/lib/api"
+import { runRestore as apiRunRestore, runCdcRestore, runHealthCheck, getHealthCheckpoints, startCdcDaemon, getPgBackRestConfig } from "@/lib/api"
 import type { HealthCheckpoint } from "@/lib/api"
 
 export default function RestorePage() {
@@ -110,12 +110,16 @@ export default function RestorePage() {
 
   const cdcInfo = cdcStatuses.find(s => s.db === cdcSourceDb)
 
-  const stanzaNames = React.useMemo(() => {
-    const names = new Set<string>()
-    servers.forEach((s) => names.add(s.label))
-    backups.forEach((b) => names.add(b.db))
-    return Array.from(names)
-  }, [servers, backups])
+  const [stanzaNames, setStanzaNames] = React.useState<string[]>([])
+
+  React.useEffect(() => {
+    getPgBackRestConfig()
+      .then((config) => {
+        const names = Object.keys(config).filter((k) => k !== "global")
+        setStanzaNames(names)
+      })
+      .catch(() => {})
+  }, [])
 
   const activeStanza = stanzaFilter || (stanzaNames.length > 0 ? stanzaNames[0] : "")
 
@@ -399,12 +403,20 @@ export default function RestorePage() {
                         <span className="font-medium">{new Date(lastCheckpoint.timestamp).toLocaleString()}</span>
                       </div>
                     ) : (
-                      <Input
-                        value={cdcTimestamp}
-                        onChange={(e) => setCdcTimestamp(e.target.value)}
-                        placeholder="e.g. 2026-07-05T14:30:00Z"
-                        className="font-mono text-sm"
-                      />
+                      <div className="flex flex-col gap-1">
+                        <Input
+                          value={cdcTimestamp}
+                          onChange={(e) => setCdcTimestamp(e.target.value)}
+                          placeholder="e.g. 2026-07-05T14:30:00Z"
+                          className="font-mono text-sm"
+                        />
+                        <p className="text-xs text-muted-foreground">
+                          ISO-8601 format. Use <code className="font-mono">Z</code> for UTC
+                          (e.g. <code className="font-mono">2026-07-05T14:30:00Z</code>) or
+                          a local offset (e.g. <code className="font-mono">+03:00</code>).
+                          Without a suffix, your local timezone is used.
+                        </p>
+                      </div>
                     )}
                     {!lastCheckpoint && (
                       <p className="text-xs text-amber-600">No health checkpoints found. Run a health check or enter a timestamp manually. Without a timestamp, the restore will replay all WAL up to now.</p>

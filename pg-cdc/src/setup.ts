@@ -67,9 +67,29 @@ export async function setupDatabase(cfg: PgCdcConfig, dbName: string): Promise<S
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
+    const hints: string[] = []
+    if (/wal_level/i.test(msg) || /logical decoding requires/i.test(msg)) {
+      hints.push(
+        `PostgreSQL wal_level must be "logical" (restart required).`,
+        `Fix: sudo ./scripts/install.sh`,
+        `Or: ALTER SYSTEM SET wal_level = 'logical'; then restart PostgreSQL.`,
+      )
+    }
+    if (/wal2json|output plugin|could not access file/i.test(msg)) {
+      hints.push(
+        `Install the wal2json output plugin for your server major version, e.g.:`,
+        `  sudo apt install postgresql-18-wal2json`,
+        `Then re-run: sudo ./scripts/install.sh`,
+      )
+    }
+    if (hints.length === 0) {
+      hints.push(
+        `Ensure wal_level=logical and the wal2json package is installed.`,
+        `Run: sudo ./scripts/install.sh`,
+      )
+    }
     throw new Error(
-      `Failed to set up replication for "${dbName}": ${msg}\n` +
-      `Ensure wal2json is installed and loaded via shared_preload_libraries.`
+      `Failed to set up replication for "${dbName}": ${msg}\n` + hints.join('\n'),
     )
   } finally {
     await sql.end()
@@ -78,10 +98,12 @@ export async function setupDatabase(cfg: PgCdcConfig, dbName: string): Promise<S
   // ---- 4. Create local capture directory ----
   const capDir = `${cfg.capture_dir}/${dbName}`
   try {
-    execSync(`sudo mkdir -p "${capDir}"`, { stdio: 'ignore', timeout: 10000 })
+    execSync(`sudo mkdir -p "${capDir}" && sudo chown postgres:postgres "${capDir}"`, { stdio: 'ignore', timeout: 10000 })
     result.directory = 'created'
   } catch {
     if (existsSync(capDir)) {
+      // Directory exists but may have wrong owner — fix it
+      try { execSync(`sudo chown postgres:postgres "${capDir}"`, { stdio: 'ignore', timeout: 5000 }) } catch { /* best-effort */ }
       result.directory = 'exists'
     } else {
       throw new Error(`Cannot create directory ${capDir}`)

@@ -388,8 +388,6 @@ export async function restoreDatabase(
 
   if (allRecords.length === 0) {
     warnings.push(`No capture stream files found in ${captureDir}. Restoring baseline only.`)
-    summary.pointInTimeReached = targetTs.toISOString()
-    return summary
   }
 
   // ---- Filter records (from baseline timestamp onward to avoid duplicates) ----

@@ -1,0 +1,17 @@
+# database-manager — passwordless sudo for backup / CDC operations
+#
+# Installed by scripts/install.sh as /etc/sudoers.d/db-manager
+# The install script substitutes @USER@ with the invoking account.
+#
+# Scope: only the commands the Node API runs via `sudo -n`. This is required
+# because the app writes under /etc/pg-cdc, /etc/pgbackrest, deploys systemd
+# units, and runs pgBackRest / psql as the postgres OS user.
+
+# Root-level file deploy, systemd control, and shell helpers
+Cmnd_Alias DB_MANAGER_ROOT = /usr/bin/cp, /bin/cp, /usr/bin/mkdir, /bin/mkdir, /usr/bin/chmod, /bin/chmod, /usr/bin/chown, /bin/chown, /usr/bin/rm, /bin/rm, /usr/bin/systemctl, /bin/systemctl, /usr/bin/bash, /bin/bash, /usr/bin/tee, /bin/tee, /usr/bin/install, /bin/install, /usr/bin/pg_ctlcluster, /bin/pg_ctlcluster, /usr/bin/apt-get, /bin/apt-get
+
+# Commands run as the postgres OS user
+Cmnd_Alias DB_MANAGER_POSTGRES = /usr/bin/pgbackrest, /usr/bin/crontab, /usr/bin/psql, /usr/bin/bash, /bin/bash
+
+@USER@ ALL=(root) NOPASSWD: DB_MANAGER_ROOT
+@USER@ ALL=(postgres) NOPASSWD: DB_MANAGER_POSTGRES

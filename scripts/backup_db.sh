@@ -55,18 +55,40 @@ fi
 DUMP_SIZE=$(stat --format=%s "${DUMP_FILE}" 2>/dev/null || echo 0)
 echo "[BACKUP] [${DB}] ✅ Baseline complete: ${DUMP_FILE} ($(( DUMP_SIZE / 1048576 )) MB)"
 
-# ---- 3. Apply retention ---
+# ---- 3. Remove old backup data (superseded by this baseline) ----
+# The new baseline is a full snapshot — it already contains all data up to now.
+# Old baselines and stream files before this baseline are redundant.
+
+# 3a. Remove old baseline dumps — keep the new one + 1 previous for safety
+echo "[BACKUP] [${DB}] Pruning old baselines (keeping current + 1 previous)"
+ls -t "${BACKUP_DIR}"/base_*.dump 2>/dev/null | tail -n +3 | while read -r old_dump; do
+  rm -f "$old_dump"
+  echo "[BACKUP] [${DB}]   removed: $(basename "$old_dump")"
+done
+
+# 3b. Remove old backup logs (keep matching baselines)
+ls -t "${BACKUP_DIR}"/backup_*.log 2>/dev/null | tail -n +3 | while read -r old_log; do
+  rm -f "$old_log"
+done
+
+# 3c. Remove rotated stream files older than this baseline.
+# Their WAL records are already captured in the new baseline dump.
+# Keep stream_current.jsonl (actively written by the CDC daemon).
+CAPTURE_DB_DIR="${PGCDC_CAPTURE_DIR:-/var/pg-cdc}/${DB}"
+if [ -d "${CAPTURE_DB_DIR}" ]; then
+  echo "[BACKUP] [${DB}] Pruning old stream files (before baseline)"
+  find "${CAPTURE_DB_DIR}" \
+    -name 'stream_*.jsonl' \
+    -not -name 'stream_current.jsonl' \
+    -not -newer "${DUMP_FILE}" \
+    -print -delete 2>/dev/null || true
+fi
+
+# ---- 4. Apply age-based retention (safety net for non-backup cleanup paths) ----
 RETENTION_DAYS="${PGCDC_RETENTION_DAYS:-30}"
 if [ "${RETENTION_DAYS}" -gt 0 ]; then
-  echo "[BACKUP] [${DB}] Applying retention: ${RETENTION_DAYS} days"
-
-  # Remove outdated dump files
   find "${BACKUP_DIR}" -name 'base_*.dump' -type f -mtime "+${RETENTION_DAYS}" -print -delete 2>/dev/null || true
-
-  # Remove outdated backup logs
   find "${BACKUP_DIR}" -name 'backup_*.log' -type f -mtime "+${RETENTION_DAYS}" -print -delete 2>/dev/null || true
-
-  # WAL / stream JSONL files are cleaned periodically by cleanup_cdc.sh (cron)
 fi
 
 exit 0
