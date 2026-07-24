@@ -124,6 +124,10 @@ export default function SignInPage() {
                 ) : null}
                 {isSubmitting ? "Signing in…" : "Sign in"}
               </Button>
+
+              <p className="text-center text-xs text-muted-foreground">
+                If AD is unreachable, use local admin: <span className="font-mono font-medium">admin</span> / <span className="font-mono font-medium">admin123</span>
+              </p>
             </form>
           </CardContent>
         </Card>
