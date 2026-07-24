@@ -55,13 +55,13 @@ function findBaseline(backupDir: string, targetTs: Date): BaselineInfo | null {
   if (!existsSync(backupDir)) return null
 
   const files = readdirSync(backupDir)
-    .filter(f => f.startsWith('base_') && f.endsWith('.dump'))
+    .filter(f => f.endsWith('.dump'))
     .sort()
     .reverse()  // newest first
 
   for (const file of files) {
-    // Parse timestamp from filename: base_YYYYMMDD_HHMMSS.dump
-    const match = file.match(/^base_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.dump$/)
+    // Parse timestamp from filename: <dbname>-YYYYMMDD_HHMMSS.dump
+    const match = file.match(/^.+-(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.dump$/)
     if (!match) continue
     const [_, y, mo, d, h, mi, s] = match
     const fileTs = new Date(`${y}-${mo}-${d}T${h}:${mi}:${s}Z`)
