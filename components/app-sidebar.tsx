@@ -5,9 +5,6 @@ import Link from "next/link"
 import { usePathname } from "next/navigation"
 import {
   DatabaseIcon,
-  HardDriveDownloadIcon,
-  HardDriveUploadIcon,
-  TimerIcon,
   LayoutDashboardIcon,
   SettingsIcon,
   ChevronUpIcon,
@@ -49,9 +46,7 @@ type NavItem = {
 
 const allNav: NavItem[] = [
   { title: "Dashboard", href: "/", icon: LayoutDashboardIcon, pageKey: "dashboard" },
-  { title: "Backup", href: "/backup", icon: HardDriveDownloadIcon, pageKey: "backup" },
-  { title: "Restore", href: "/restore", icon: HardDriveUploadIcon, pageKey: "restore" },
-  { title: "Cron Jobs", href: "/cron", icon: TimerIcon, pageKey: "cron" },
+  { title: "Databases", href: "/databases", icon: DatabaseIcon, pageKey: "databases" },
   { title: "Users", href: "/users", icon: UsersIcon, pageKey: "users" },
   { title: "Settings", href: "/settings", icon: SettingsIcon, pageKey: "settings" }
 ]

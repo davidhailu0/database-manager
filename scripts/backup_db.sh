@@ -58,18 +58,13 @@ echo "[BACKUP] [${DB}] ✅ Baseline complete: ${DUMP_FILE} ($(( DUMP_SIZE / 1048
 # ---- 3. Remove old backup data (superseded by this baseline) ----
 # The new baseline is a full snapshot — it already contains all data up to now.
 # Old baselines and stream files before this baseline are redundant.
+# NOTE: On-disk dump retention is managed by the API's enforceRetention()
+# function based on the keepLatest config. Do NOT hard-prune here —
+# otherwise older backups listed in the UI become un-restorable.
 
-# 3a. Remove old baseline dumps — keep the new one + 1 previous for safety
-echo "[BACKUP] [${DB}] Pruning old baselines (keeping current + 1 previous)"
-ls -t "${BACKUP_DIR}"/base_*.dump 2>/dev/null | tail -n +3 | while read -r old_dump; do
-  rm -f "$old_dump"
-  echo "[BACKUP] [${DB}]   removed: $(basename "$old_dump")"
-done
+# 3a. (removed — enforceRetention handles dump retention via keepLatest)
 
-# 3b. Remove old backup logs (keep matching baselines)
-ls -t "${BACKUP_DIR}"/backup_*.log 2>/dev/null | tail -n +3 | while read -r old_log; do
-  rm -f "$old_log"
-done
+# 3b. (removed — enforceRetention handles log retention via keepLatest)
 
 # 3c. Remove rotated stream files older than this baseline.
 # Their WAL records are already captured in the new baseline dump.

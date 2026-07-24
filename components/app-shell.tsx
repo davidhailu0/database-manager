@@ -13,9 +13,8 @@ import { AppSidebar } from "@/components/app-sidebar"
 
 function useRouteTitle(pathname: string) {
   if (pathname === "/") return "Dashboard"
-  if (pathname.startsWith("/backup")) return "Backup"
-  if (pathname.startsWith("/restore")) return "Restore"
-  if (pathname.startsWith("/cron")) return "Cron Jobs"
+  if (pathname.startsWith("/databases/")) return "Database"
+  if (pathname.startsWith("/databases")) return "Databases"
   if (pathname.startsWith("/settings")) return "Settings"
   if (pathname.startsWith("/users")) return "Users"
   return "DB Manager"

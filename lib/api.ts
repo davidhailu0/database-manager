@@ -17,6 +17,24 @@ export type StorageSettings = {
   retentionDays: number
 }
 
+export type DbConfig = {
+  db: string
+  destinationPath: string
+  scheduleCron: string
+  keepLatest: number
+  enabled: boolean
+  createdAt: string
+  updatedAt: string
+}
+
+export type RestoreFlags = {
+  targetDb?: string
+  dataOnly?: boolean
+  createDb?: boolean
+  schemaOnly?: boolean
+  clean?: boolean
+}
+
 export type PgBackRestConfig = Record<string, { key: string; value: string }[]>
 
 export type ServerRecord = {
@@ -137,8 +155,8 @@ export async function runBackup(stanza: string, type: "Full" | "Incremental") {
 }
 
 // Restore
-export async function runRestore(snapshotId: string) {
-  return post<{ message: string }>("/api/restore", { snapshotId })
+export async function runRestore(snapshotId: string, flags?: RestoreFlags) {
+  return post<{ message: string; output?: string }>("/api/restore", { snapshotId, ...flags })
 }
 
 // Backups list / delete
@@ -190,19 +208,39 @@ export async function saveStorageSettings(input: StorageSettings) {
   return post<{ message: string }>("/api/settings/storage", input)
 }
 
+// Database configs
+export async function listDbConfigs(): Promise<DbConfig[]> {
+  const data = await get<{ configs: DbConfig[] }>("/api/db-configs")
+  return data.configs
+}
+
+export async function upsertDbConfig(input: {
+  db: string
+  destinationPath: string
+  scheduleCron: string
+  keepLatest: number
+  enabled?: boolean
+}) {
+  return post<{ config: DbConfig }>("/api/db-configs", input)
+}
+
+export async function deleteDbConfig(db: string) {
+  return post<{ message: string }>("/api/db-configs/delete", { db })
+}
+
 // pgBackRest config
-export async function getPgBackRestConfig(): Promise<PgBackRestConfig> {
-  const data = await get<{ config: PgBackRestConfig }>("/api/settings/pgbackrest")
-  return data.config
-}
-
-export async function savePgBackRestConfig(config: PgBackRestConfig) {
-  return post<{ message: string }>("/api/settings/pgbackrest", { config })
-}
-
-export async function stanzaCreate(stanza: string) {
-  return post<{ message: string; output: string }>("/api/stanza-create", { stanza })
-}
+// export async function getPgBackRestConfig(): Promise<PgBackRestConfig> {
+//   const data = await get<{ config: PgBackRestConfig }>("/api/settings/pgbackrest")
+//   return data.config
+// }
+//
+// export async function savePgBackRestConfig(config: PgBackRestConfig) {
+//   return post<{ message: string }>("/api/settings/pgbackrest", { config })
+// }
+//
+// export async function stanzaCreate(stanza: string) {
+//   return post<{ message: string; output: string }>("/api/stanza-create", { stanza })
+// }
 
 // Servers
 export async function listServers(): Promise<ServerRecord[]> {

@@ -3,7 +3,6 @@
 import * as React from "react"
 import { toast } from "sonner"
 import {
-  UsersIcon,
   PlusIcon,
   Trash2Icon,
   ShieldIcon,
@@ -42,9 +41,7 @@ import type { AppUser } from "@/lib/api"
 
 const ALL_PAGES = [
   { key: "dashboard", label: "Dashboard" },
-  { key: "backup", label: "Backup" },
-  { key: "restore", label: "Restore" },
-  { key: "cron", label: "Cron Jobs" },
+  { key: "databases", label: "Databases" },
   { key: "settings", label: "Settings" },
   { key: "users", label: "Users" },
 ]
@@ -54,10 +51,8 @@ const ALL_ACTIONS = [
   { key: "backup:delete", label: "Delete backup" },
   { key: "backup:retry", label: "Retry backup" },
   { key: "restore:run", label: "Run restore" },
-  { key: "cron:create", label: "Create cron job" },
-  { key: "cron:update", label: "Update cron job" },
-  { key: "cron:delete", label: "Delete cron job" },
-  { key: "cron:run", label: "Run cron job" },
+  { key: "config:read", label: "Read config" },
+  { key: "config:write", label: "Write config" },
   { key: "settings:read", label: "Read settings" },
   { key: "settings:write", label: "Write settings" },
   { key: "users:manage", label: "Manage users" },

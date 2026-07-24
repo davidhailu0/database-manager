@@ -80,10 +80,10 @@ fi
 
 # ---- 3. pgBackRest log directory — rotate-oldest logic via logrotate not possible here;
 #        instead, delete logs older than 90 days (reasonable for debugging history)
-PGBACKREST_LOG_DIR="/var/log/pgbackrest"
-if [ -d "${PGBACKREST_LOG_DIR}" ]; then
-  echo "[CLEANUP] Cleaning pgBackRest logs older than 90 days"
-  find "${PGBACKREST_LOG_DIR}" -name '*.log' -type f -mtime +90 -print -delete 2>/dev/null || true
-fi
+# PGBACKREST_LOG_DIR="/var/log/pgbackrest"
+# if [ -d "${PGBACKREST_LOG_DIR}" ]; then
+#   echo "[CLEANUP] Cleaning pgBackRest logs older than 90 days"
+#   find "${PGBACKREST_LOG_DIR}" -name '*.log' -type f -mtime +90 -print -delete 2>/dev/null || true
+# fi
 
 echo "[CLEANUP] Done"

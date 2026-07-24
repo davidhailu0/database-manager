@@ -5,14 +5,13 @@ import Link from "next/link"
 import {
   DatabaseIcon,
   HardDriveDownloadIcon,
-  TimerIcon,
   ActivityIcon,
   ArrowRightIcon,
   ServerIcon,
   RadioIcon,
-  AlertCircleIcon,
   CheckCircle2Icon,
   XCircleIcon,
+  Loader2Icon,
 } from "lucide-react"
 
 import {
@@ -25,8 +24,7 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { useDb } from "@/lib/db-context"
-import { listCronJobs, startCdcDaemon } from "@/lib/api"
-import type { CdcDbStatus } from "@/lib/api"
+import { startCdcDaemon } from "@/lib/api"
 import { toast } from "sonner"
 
 function statusBadge(status: string) {
@@ -38,12 +36,12 @@ function statusBadge(status: string) {
 }
 
 export function DbStats() {
-  const { servers, backups } = useDb()
-  const [cronCount, setCronCount] = React.useState(0)
+  const { servers, backups, cdcStatuses, loading } = useDb()
 
-  React.useEffect(() => {
-    listCronJobs().then((jobs) => setCronCount(jobs.length)).catch(() => setCronCount(0))
-  }, [])
+  const totalDbs = servers.reduce((sum, s) => sum + s.databases.length, 0)
+  const healthyCount = cdcStatuses.filter(s => s.daemonRunning && s.slotActive).length
+  const degradedCount = cdcStatuses.filter(s => !(s.daemonRunning && s.slotActive)).length
+  const unprotectedCount = Math.max(0, totalDbs - cdcStatuses.length)
 
   return (
     <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -52,29 +50,35 @@ export function DbStats() {
           <CardDescription className="text-xs font-medium">Servers</CardDescription>
           <ServerIcon className="size-4 text-muted-foreground" />
         </CardHeader>
-        <CardTitle className="px-6 pb-6 text-2xl">{servers.length}</CardTitle>
+        <CardTitle className="px-6 pb-6 text-2xl">{loading ? "…" : servers.length}</CardTitle>
+      </Card>
+      <Card className="shadow-none">
+        <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
+          <CardDescription className="text-xs font-medium">Databases</CardDescription>
+          <DatabaseIcon className="size-4 text-muted-foreground" />
+        </CardHeader>
+        <CardTitle className="px-6 pb-6 text-2xl">{loading ? "…" : totalDbs}</CardTitle>
       </Card>
       <Card className="shadow-none">
         <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
           <CardDescription className="text-xs font-medium">Total backups</CardDescription>
           <HardDriveDownloadIcon className="size-4 text-muted-foreground" />
         </CardHeader>
-        <CardTitle className="px-6 pb-6 text-2xl">{backups.length}</CardTitle>
-      </Card>
-      <Card className="shadow-none">
-        <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
-          <CardDescription className="text-xs font-medium">Active cron jobs</CardDescription>
-          <TimerIcon className="size-4 text-muted-foreground" />
-        </CardHeader>
-        <CardTitle className="px-6 pb-6 text-2xl">{cronCount}</CardTitle>
+        <CardTitle className="px-6 pb-6 text-2xl">{loading ? "…" : backups.length}</CardTitle>
       </Card>
       <Card className="shadow-none">
         <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
           <CardDescription className="text-xs font-medium">Health</CardDescription>
-          <ActivityIcon className="size-4 text-emerald-500" />
+          <ActivityIcon className={`size-4 ${healthyCount > 0 ? "text-emerald-500" : unprotectedCount > 0 ? "text-amber-500" : "text-muted-foreground"}`} />
         </CardHeader>
         <CardTitle className="px-6 pb-6 text-2xl">
-          {servers.length > 0 ? `${servers.length} server${servers.length > 1 ? 's' : ''}` : "Disconnected"}
+          {loading ? "…" : servers.length === 0 ? "Disconnected" : (
+            <span className="flex items-center gap-2 text-base">
+              <span className="text-emerald-600">{healthyCount}</span>
+              {degradedCount > 0 && <span className="text-amber-600">{degradedCount}</span>}
+              {unprotectedCount > 0 && <span className="text-muted-foreground">{unprotectedCount}</span>}
+            </span>
+          )}
         </CardTitle>
       </Card>
     </div>
@@ -82,11 +86,7 @@ export function DbStats() {
 }
 
 export function DbDatabases() {
-  const { servers } = useDb()
-
-  const allDbs = servers.flatMap((s) =>
-    s.databases.map((db) => ({ server: s.label, engine: s.engine, db }))
-  )
+  const { servers, loading } = useDb()
 
   return (
     <Card className="shadow-none">
@@ -95,7 +95,9 @@ export function DbDatabases() {
         <CardDescription>Your configured servers and their discovered databases.</CardDescription>
       </CardHeader>
       <CardContent>
-        {servers.length === 0 ? (
+        {loading ? (
+          <p className="text-sm text-muted-foreground">Loading servers…</p>
+        ) : servers.length === 0 ? (
           <p className="text-sm text-muted-foreground">
             No servers configured. Go to{" "}
             <a href="/settings" className="text-primary underline underline-offset-2">Settings</a> to add one.
@@ -133,8 +135,14 @@ export function DbDatabases() {
 }
 
 export function DbRecentBackups() {
-  const { backups } = useDb()
-  const recent = backups.slice(0, 4)
+  const { backups, loading } = useDb()
+  const recent = [...backups]
+    .sort((a, b) => {
+      const ta = new Date(a.createdAtIso ?? a.createdAt).getTime()
+      const tb = new Date(b.createdAtIso ?? b.createdAt).getTime()
+      return (isNaN(tb) ? 0 : tb) - (isNaN(ta) ? 0 : ta)
+    })
+    .slice(0, 4)
 
   return (
     <Card className="shadow-none">
@@ -143,12 +151,14 @@ export function DbRecentBackups() {
           <CardTitle className="text-sm font-semibold">Recent backups</CardTitle>
           <CardDescription>Latest backup activity across all databases.</CardDescription>
         </div>
-        <Button variant="ghost" size="sm" nativeButton={false} render={<Link href="/restore" />}>
-          Restore <ArrowRightIcon className="ml-1 size-3" />
+        <Button variant="ghost" size="sm" nativeButton={false} render={<Link href="/databases" />}>
+          Databases <ArrowRightIcon className="ml-1 size-3" />
         </Button>
       </CardHeader>
       <CardContent className="px-0">
-        {recent.length === 0 ? (
+        {loading ? (
+          <p className="px-6 py-4 text-sm text-muted-foreground">Loading backups…</p>
+        ) : recent.length === 0 ? (
           <p className="px-6 py-4 text-sm text-muted-foreground">No backups yet.</p>
         ) : (
           <div className="divide-y">
@@ -179,7 +189,7 @@ export function DbRecentBackups() {
 }
 
 export function DbCdcStats() {
-  const { cdcStatuses } = useDb()
+  const { cdcStatuses, loading } = useDb()
   const protectedCount = cdcStatuses.length
   const healthyCount = cdcStatuses.filter(s => s.daemonRunning && s.slotActive).length
 
@@ -190,14 +200,14 @@ export function DbCdcStats() {
           <CardDescription className="text-xs font-medium">Protected DBs</CardDescription>
           <RadioIcon className="size-4 text-muted-foreground" />
         </CardHeader>
-        <CardTitle className="px-6 pb-6 text-2xl">{protectedCount}</CardTitle>
+        <CardTitle className="px-6 pb-6 text-2xl">{loading ? "…" : protectedCount}</CardTitle>
       </Card>
       <Card className="shadow-none">
         <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
           <CardDescription className="text-xs font-medium">Healthy daemons</CardDescription>
           <CheckCircle2Icon className="size-4 text-emerald-500" />
         </CardHeader>
-        <CardTitle className="px-6 pb-6 text-2xl">{healthyCount}/{protectedCount}</CardTitle>
+        <CardTitle className="px-6 pb-6 text-2xl">{loading ? "…" : `${healthyCount}/${protectedCount}`}</CardTitle>
       </Card>
       <Card className="shadow-none">
         <CardHeader className="flex-row items-center justify-between space-y-0 pb-2">
@@ -205,7 +215,7 @@ export function DbCdcStats() {
           <XCircleIcon className="size-4 text-red-500" />
         </CardHeader>
         <CardTitle className="px-6 pb-6 text-2xl">
-          {cdcStatuses.filter(s => !s.daemonRunning).length}
+          {loading ? "…" : cdcStatuses.filter(s => !s.daemonRunning).length}
         </CardTitle>
       </Card>
       <Card className="shadow-none">
@@ -214,7 +224,7 @@ export function DbCdcStats() {
           <XCircleIcon className="size-4 text-red-500" />
         </CardHeader>
         <CardTitle className="px-6 pb-6 text-2xl">
-          {cdcStatuses.filter(s => !s.slotActive).length}
+          {loading ? "…" : cdcStatuses.filter(s => !s.slotActive).length}
         </CardTitle>
       </Card>
     </div>
@@ -222,11 +232,14 @@ export function DbCdcStats() {
 }
 
 export function DbCdcDetails() {
-  const { cdcStatuses, refreshCdcStatus } = useDb()
+  const { cdcStatuses, refreshCdcStatus, loading } = useDb()
+  const [startingDb, setStartingDb] = React.useState<string | null>(null)
 
+  if (loading) return null
   if (cdcStatuses.length === 0) return null
 
   async function handleStartDaemon(dbName: string) {
+    setStartingDb(dbName)
     try {
       await startCdcDaemon(dbName)
       toast.success(`Daemon started for "${dbName}"`)
@@ -235,6 +248,8 @@ export function DbCdcDetails() {
       toast.error("Failed to start daemon", {
         description: err instanceof Error ? err.message : String(err),
       })
+    } finally {
+      setStartingDb(null)
     }
   }
 
@@ -284,9 +299,18 @@ export function DbCdcDetails() {
                 </div>
               )}
               {!s.daemonRunning && (
-                <Button variant="outline" size="sm" onClick={() => handleStartDaemon(s.db)}>
-                  <RadioIcon className="mr-1 size-3.5" />
-                  Start
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => handleStartDaemon(s.db)}
+                  disabled={startingDb === s.db}
+                >
+                  {startingDb === s.db ? (
+                    <Loader2Icon className="mr-1 size-3.5 animate-spin" />
+                  ) : (
+                    <RadioIcon className="mr-1 size-3.5" />
+                  )}
+                  {startingDb === s.db ? "Starting\u2026" : "Start"}
                 </Button>
               )}
             </div>

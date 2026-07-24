@@ -1,8 +1,8 @@
 "use client"
 
 import * as React from "react"
-import { listBackups as apiListBackups, getStorageSettings as apiGetStorageSettings, listServers, getCdcStatus, setupCdcForDb as apiSetupCdcForDb } from "@/lib/api"
-import type { ServerRecord, CdcDbStatus } from "@/lib/api"
+import { listBackups as apiListBackups, getStorageSettings as apiGetStorageSettings, listServers, getCdcStatus, setupCdcForDb as apiSetupCdcForDb, listDbConfigs as apiListDbConfigs } from "@/lib/api"
+import type { ServerRecord, CdcDbStatus, DbConfig } from "@/lib/api"
 import { useAuth } from "@/lib/auth-context"
 
 export type Backup = {
@@ -11,6 +11,7 @@ export type Backup = {
   type: "Full" | "Incremental"
   size: string
   createdAt: string
+  createdAtIso?: string | null
   status: "Completed" | "Running" | "Failed"
   source: "pgbackrest" | "cdc"
 }
@@ -20,12 +21,15 @@ type DbContextValue = {
   backups: Backup[]
   storagePath: string
   retentionDays: number
+  dbConfigs: DbConfig[]
+  loading: boolean
   addBackup: (backup: Backup) => void
   updateBackup: (id: string, updates: Partial<Backup>) => void
   deleteBackup: (id: string) => void
   refreshBackups: () => Promise<void>
   refreshStorageSettings: () => Promise<void>
   refreshServers: () => Promise<void>
+  refreshDbConfigs: () => Promise<void>
   isRestoring: boolean
   setIsRestoring: (v: boolean) => void
   setStoragePath: (path: string) => void
@@ -51,8 +55,8 @@ function readStoredBackups(): Backup[] {
 }
 
 function readStoredPath(): string {
-  if (typeof window === "undefined") return "/var/backups/db"
-  return localStorage.getItem(STORAGE_PATH_KEY) ?? "/var/backups/db"
+  if (typeof window === "undefined") return "/var/backups/pg"
+  return localStorage.getItem(STORAGE_PATH_KEY) ?? "/var/backups/pg"
 }
 
 function readStoredRetention(): number {
@@ -67,10 +71,12 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
   const { token } = useAuth()
   const [backups, setBackups] = React.useState<Backup[]>([])
   const [isRestoring, setIsRestoring] = React.useState(false)
-  const [storagePath, setStoragePath] = React.useState('/var/backups/db')
+  const [storagePath, setStoragePath] = React.useState('/var/backups/pg')
   const [retentionDays, setRetentionDays] = React.useState(30)
   const [servers, setServers] = React.useState<ServerRecord[]>([])
   const [cdcStatuses, setCdcStatuses] = React.useState<CdcDbStatus[]>([])
+  const [dbConfigs, setDbConfigs] = React.useState<DbConfig[]>([])
+  const [loading, setLoading] = React.useState(true)
   const skipBackupsSave = React.useRef(true)
 
   const refreshBackups = React.useCallback(async () => {
@@ -111,12 +117,22 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
+  const refreshDbConfigs = React.useCallback(async () => {
+    try {
+      const api = await apiListDbConfigs()
+      setDbConfigs(api)
+    } catch {
+      setDbConfigs([])
+    }
+  }, [])
+
   const setupCdc = React.useCallback(async (dbName: string) => {
     await apiSetupCdcForDb(dbName)
     await refreshCdcStatus()
   }, [refreshCdcStatus])
 
   React.useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setStoragePath(readStoredPath())
     setRetentionDays(readStoredRetention())
     const stored = readStoredBackups()
@@ -127,9 +143,14 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
 
   React.useEffect(() => {
     if (!token) return
-    refreshServers()
-    refreshBackups()
-    refreshCdcStatus()
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setLoading(true)
+    Promise.all([
+      refreshServers(),
+      refreshBackups(),
+      refreshCdcStatus(),
+      refreshDbConfigs(),
+    ]).finally(() => setLoading(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token])
 
@@ -138,7 +159,9 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
       skipBackupsSave.current = false
       return
     }
-    localStorage.setItem(BACKUPS_KEY, JSON.stringify(backups))
+    // Don't persist "Running" placeholder backups to localStorage
+    const toSave = backups.filter((b) => b.status !== "Running")
+    localStorage.setItem(BACKUPS_KEY, JSON.stringify(toSave))
   }, [backups])
 
   React.useEffect(() => {
@@ -159,9 +182,9 @@ export function DbProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <DbContext.Provider value={{
-      servers, backups, storagePath, retentionDays,
+      servers, backups, storagePath, retentionDays, dbConfigs, loading,
       addBackup, updateBackup, deleteBackup,
-      refreshBackups, refreshStorageSettings, refreshServers,
+      refreshBackups, refreshStorageSettings, refreshServers, refreshDbConfigs,
       isRestoring, setIsRestoring,
       setStoragePath, setRetentionDays,
       cdcStatuses, refreshCdcStatus, setupCdc,
