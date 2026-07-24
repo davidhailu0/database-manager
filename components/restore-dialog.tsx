@@ -7,6 +7,7 @@ import {
   Loader2Icon,
   AlertTriangleIcon,
   DatabaseIcon,
+  ClockIcon,
 } from "lucide-react"
 
 import {
@@ -33,7 +34,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Badge } from "@/components/ui/badge"
-import { runRestore as apiRunRestore } from "@/lib/api"
+import { runRestore as apiRunRestore, runCdcRestore as apiRunCdcRestore } from "@/lib/api"
 import type { Backup } from "@/lib/db-context"
 
 function RestoreForm({
@@ -50,23 +51,41 @@ function RestoreForm({
   const [createDb, setCreateDb] = React.useState(false)
   const [schemaOnly, setSchemaOnly] = React.useState(false)
   const [clean, setClean] = React.useState(false)
+  const [restoreTime, setRestoreTime] = React.useState("")
   const [isRestoring, setIsRestoring] = React.useState(false)
   const [confirmOpen, setConfirmOpen] = React.useState(false)
 
   const isOverwrite = targetDb === backup.db
-  const canRestore = backup.status === "Completed" && targetDb.trim().length > 0
+  const isCdcBackup = backup.source === "cdc"
+  const pitrTs = restoreTime.trim() ? new Date(restoreTime) : null
+  const hasPitr = pitrTs !== null && !isNaN(pitrTs.getTime())
+  const canRestore =
+    backup.status === "Completed" &&
+    targetDb.trim().length > 0 &&
+    (!restoreTime.trim() || hasPitr)
 
   async function handleRestore() {
     setConfirmOpen(false)
     setIsRestoring(true)
     try {
-      const result = await apiRunRestore(backup.id, {
-        targetDb: targetDb.trim(),
-        dataOnly,
-        createDb,
-        schemaOnly,
-        clean,
-      })
+      let result: { message: string; output?: string }
+      if (hasPitr && pitrTs) {
+        const isoTs = pitrTs.toISOString()
+        result = await apiRunCdcRestore(
+          backup.db,
+          targetDb.trim(),
+          isoTs,
+          isOverwrite,
+        )
+      } else {
+        result = await apiRunRestore(backup.id, {
+          targetDb: targetDb.trim(),
+          dataOnly,
+          createDb,
+          schemaOnly,
+          clean,
+        })
+      }
       toast.success("Restore completed", {
         description: result.message,
       })
@@ -137,9 +156,30 @@ function RestoreForm({
           )}
         </div>
 
+        {isCdcBackup && (
+        <div className="flex flex-col gap-2">
+          <Label htmlFor="restore-time" className="text-xs flex items-center gap-1.5">
+            <ClockIcon className="size-3.5 text-muted-foreground" />
+            Restore to specific time (optional)
+          </Label>
+          <Input
+            id="restore-time"
+            type="datetime-local"
+            value={restoreTime}
+            onChange={(e) => setRestoreTime(e.target.value)}
+            className="text-sm"
+          />
+          <span className="text-xs text-muted-foreground">
+            {hasPitr
+              ? "Point-in-time restore via WAL replay. pg_restore flags below do not apply."
+              : "Leave empty for a plain snapshot restore. Set a time to replay WAL records up to that point."}
+          </span>
+        </div>
+        )}
+
         <div className="flex flex-col gap-2">
           <Label className="text-xs">Restore options</Label>
-          <div className="grid gap-2">
+          <div className={`grid gap-2 ${hasPitr ? "opacity-50 pointer-events-none" : ""}`}>
             <label className="flex items-start gap-2.5 cursor-pointer rounded-md border p-2.5 hover:bg-muted/50 transition-colors">
               <Checkbox
                 checked={dataOnly}
@@ -204,7 +244,15 @@ function RestoreForm({
           </div>
         </div>
 
-        {(dataOnly || schemaOnly || createDb || clean) && (
+        {hasPitr && (
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="text-xs text-muted-foreground">Active mode:</span>
+            <Badge variant="secondary" className="text-xs">PITR (WAL replay)</Badge>
+            <Badge variant="secondary" className="text-xs font-mono">{hasPitr ? pitrTs!.toLocaleString() : restoreTime}</Badge>
+          </div>
+        )}
+
+        {(dataOnly || schemaOnly || createDb || clean) && !hasPitr && (
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="text-xs text-muted-foreground">Active flags:</span>
             {dataOnly && <Badge variant="secondary" className="text-xs">--data-only</Badge>}
@@ -217,9 +265,11 @@ function RestoreForm({
         <div className="flex items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
           <AlertTriangleIcon className="size-3.5 shrink-0 mt-0.5" />
           <span>
-            {isOverwrite || clean
+            {isOverwrite || (clean && !hasPitr)
               ? "This action will modify the target database and cannot be undone. Ensure you have a recent backup."
-              : "The restore will load data into the target database. Existing objects with the same name may cause errors."}
+              : hasPitr
+                ? "Point-in-time restore will replay WAL records on top of the baseline snapshot. Existing data in the target will be overwritten."
+                : "The restore will load data into the target database. Existing objects with the same name may cause errors."}
           </span>
         </div>
       </div>
@@ -243,7 +293,13 @@ function RestoreForm({
               <AlertDialogDescription>
                 Backup <span className="font-mono">{backup.id}</span> will be restored
                 to database <span className="font-mono">{targetDb}</span>.
-                {isOverwrite || clean
+                {hasPitr && pitrTs && (
+                  <>
+                    {" "}WAL records will be replayed up to{" "}
+                    <span className="font-mono">{pitrTs.toLocaleString()}</span>.
+                  </>
+                )}
+                {isOverwrite || (clean && !hasPitr)
                   ? " This will overwrite existing data and cannot be undone."
                   : ""}
               </AlertDialogDescription>

@@ -369,6 +369,10 @@ export async function deleteUser(token: string, id: string) {
   return post<{ message: string }>("/api/users/delete", { id }, { headers: { Authorization: `Bearer ${token}` } })
 }
 
+export async function setUserPassword(token: string, id: string, password: string) {
+  return post<{ message: string }>("/api/users/set-password", { id, password }, { headers: { Authorization: `Bearer ${token}` } })
+}
+
 // System — reconciliation
 export async function reconcileOrphanedResources(token: string) {
   return post<{ message: string; orphanedCdcDbs: string[]; orphanedStanzas: string[]; orphanedServices: string[]; orphanedSlots: string[]; errors: string[] }>("/api/system/reconcile", {}, { headers: { Authorization: `Bearer ${token}` } })

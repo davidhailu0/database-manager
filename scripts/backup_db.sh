@@ -18,8 +18,8 @@ DB="${1:?Usage: $0 <dbname>}"
 BACKUP_DIR="${PGCDC_BACKUP_DIR:-/var/backups/pg}/${DB}"
 ALERT_CMD="${PGCDC_ALERT_COMMAND:-/etc/pg-cdc/alert.sh}"
 TIMESTAMP=$(date -u '+%Y%m%d_%H%M%S')
-DUMP_FILE="${BACKUP_DIR}/base_${TIMESTAMP}.dump"
-LOG_FILE="${BACKUP_DIR}/backup_${TIMESTAMP}.log"
+DUMP_FILE="${BACKUP_DIR}/${DB}-${TIMESTAMP}.dump"
+LOG_FILE="${BACKUP_DIR}/${DB}-${TIMESTAMP}.log"
 
 mkdir -p "${BACKUP_DIR}"
 
@@ -82,8 +82,8 @@ fi
 # ---- 4. Apply age-based retention (safety net for non-backup cleanup paths) ----
 RETENTION_DAYS="${PGCDC_RETENTION_DAYS:-30}"
 if [ "${RETENTION_DAYS}" -gt 0 ]; then
-  find "${BACKUP_DIR}" -name 'base_*.dump' -type f -mtime "+${RETENTION_DAYS}" -print -delete 2>/dev/null || true
-  find "${BACKUP_DIR}" -name 'backup_*.log' -type f -mtime "+${RETENTION_DAYS}" -print -delete 2>/dev/null || true
+  find "${BACKUP_DIR}" -name "${DB}-*.dump" -type f -mtime "+${RETENTION_DAYS}" -print -delete 2>/dev/null || true
+  find "${BACKUP_DIR}" -name "${DB}-*.log" -type f -mtime "+${RETENTION_DAYS}" -print -delete 2>/dev/null || true
 fi
 
 exit 0

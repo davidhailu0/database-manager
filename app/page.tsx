@@ -1,5 +1,8 @@
+"use client"
+
 import Link from "next/link"
-import { ArrowRightIcon } from "lucide-react"
+import { ArrowRightIcon, RefreshCwIcon } from "lucide-react"
+import { toast } from "sonner"
 
 import { AppShell } from "@/components/app-shell"
 import {
@@ -11,16 +14,33 @@ import {
 } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { DbDatabases, DbRecentBackups, DbStats, DbCdcStats, DbCdcDetails } from "@/components/db-overview"
+import { useDb } from "@/lib/db-context"
 
 export default function DashboardPage() {
+  const { refreshBackups, refreshCdcStatus, refreshServers, refreshDbConfigs } = useDb()
+
+  function handleRefresh() {
+    toast.info("Refreshing\u2026")
+    refreshServers()
+    refreshBackups()
+    refreshCdcStatus()
+    refreshDbConfigs()
+  }
+
   return (
     <AppShell>
       <div className="mx-auto flex max-w-5xl flex-col gap-8">
-        <div>
-          <h2 className="text-lg font-semibold tracking-tight">Dashboard</h2>
-          <p className="text-sm text-muted-foreground">
-            Monitor database health, backups, and replication status.
-          </p>
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight">Dashboard</h2>
+            <p className="text-sm text-muted-foreground">
+              Monitor database health, backups, and replication status.
+            </p>
+          </div>
+          <Button variant="ghost" size="sm" onClick={handleRefresh}>
+            <RefreshCwIcon className="mr-1.5 size-3.5" />
+            Refresh
+          </Button>
         </div>
 
         <DbStats />

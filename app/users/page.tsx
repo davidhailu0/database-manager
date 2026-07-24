@@ -7,6 +7,8 @@ import {
   Trash2Icon,
   ShieldIcon,
   SaveIcon,
+  KeyIcon,
+  Loader2Icon,
 } from "lucide-react"
 
 import { AppShell } from "@/components/app-shell"
@@ -32,10 +34,19 @@ import { Separator } from "@/components/ui/separator"
 import { Switch } from "@/components/ui/switch"
 import { useAuth } from "@/lib/auth-context"
 import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import {
   listUsers,
   createUser,
   updateUser,
   deleteUser,
+  setUserPassword,
 } from "@/lib/api"
 import type { AppUser } from "@/lib/api"
 
@@ -153,8 +164,31 @@ function UserRow({ user, token, onRefresh }: { user: AppUser; token: string; onR
   const [pages, setPages] = React.useState<string[]>(user.allowedPages)
   const [actions, setActions] = React.useState<string[]>(user.allowedActions)
   const [isSaving, setIsSaving] = React.useState(false)
+  const [pwDialogOpen, setPwDialogOpen] = React.useState(false)
+  const [newPassword, setNewPassword] = React.useState("")
+  const [isSavingPw, setIsSavingPw] = React.useState(false)
 
   const isSelf = currentUser?.id === user.id
+
+  async function handleSetPassword() {
+    if (!newPassword || newPassword.length < 4) {
+      toast.error("Password must be at least 4 characters")
+      return
+    }
+    setIsSavingPw(true)
+    try {
+      await setUserPassword(token, user.id, newPassword)
+      toast.success(`Password set for ${user.displayName}`)
+      setPwDialogOpen(false)
+      setNewPassword("")
+    } catch (err) {
+      toast.error("Failed to set password", {
+        description: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setIsSavingPw(false)
+    }
+  }
 
   async function handleSave() {
     setIsSaving(true)
@@ -221,6 +255,9 @@ function UserRow({ user, token, onRefresh }: { user: AppUser; token: string; onR
               <SaveIcon className="size-3.5" />
             </Button>
           )}
+          <Button variant="ghost" size="sm" onClick={() => setPwDialogOpen(true)} title="Set local password">
+            <KeyIcon className="size-3.5" />
+          </Button>
           {!isSelf && (
             <Button variant="ghost" size="sm" onClick={handleDelete}>
               <Trash2Icon className="size-3.5" />
@@ -272,6 +309,41 @@ function UserRow({ user, token, onRefresh }: { user: AppUser; token: string; onR
           )}
         </div>
       )}
+
+      <Dialog open={pwDialogOpen} onOpenChange={setPwDialogOpen}>
+        <DialogContent className="sm:max-w-sm">
+          <DialogHeader>
+            <DialogTitle className="flex items-center gap-2 text-sm">
+              <KeyIcon className="size-4" />
+              Set local password
+            </DialogTitle>
+            <DialogDescription>
+              Set a local password for {user.displayName}. Used as fallback when the AD server is unreachable.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3 py-2">
+            <Input
+              type="password"
+              placeholder="New password (min 4 chars)"
+              value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)}
+              className="text-sm"
+              autoComplete="new-password"
+            />
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => setPwDialogOpen(false)}>
+              Cancel
+            </Button>
+            <Button size="sm" onClick={handleSetPassword} disabled={isSavingPw}>
+              {isSavingPw ? (
+                <Loader2Icon className="mr-1.5 size-3.5 animate-spin" />
+              ) : null}
+              {isSavingPw ? "Saving\u2026" : "Set password"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

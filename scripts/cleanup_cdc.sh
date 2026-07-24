@@ -72,7 +72,7 @@ if [ -d "${BACKUP_DIR}" ]; then
     fi
 
     echo "[CLEANUP] [${db_name}] Cleaning backup logs (retention: ${db_retention} days)"
-    find "${db_dir}" -name 'backup_*.log' -type f -mtime "+${db_retention}" -print -delete 2>/dev/null || true
+    find "${db_dir}" -name "${db_name}-*.log" -type f -mtime "+${db_retention}" -print -delete 2>/dev/null || true
   done
 else
   echo "[CLEANUP] Backup dir ${BACKUP_DIR} not found — skipping backup log cleanup"

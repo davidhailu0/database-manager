@@ -2727,6 +2727,32 @@ app.post('/users/delete', async (c) => {
   }
 })
 
+// Set/reset a user's local password (for fallback auth when AD is unreachable)
+app.post('/users/set-password', async (c) => {
+  try {
+    const admin = requireAuth(c)
+    if (!admin) return c.json({ success: false, error: 'Not authenticated' }, 401)
+    if (admin.role !== 'admin') return c.json({ success: false, error: 'Forbidden' }, 403)
+
+    const { id, password } = await c.req.json()
+    if (!id) return c.json({ success: false, error: 'User ID is required' }, 400)
+    if (!password || typeof password !== 'string' || password.length < 4) {
+      return c.json({ success: false, error: 'Password must be at least 4 characters' }, 400)
+    }
+
+    const users = listUsers()
+    const target = users.find(u => u.id === id)
+    if (!target) return c.json({ success: false, error: 'User not found' }, 404)
+
+    const hash = hashPassword(password)
+    getDb().prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hash, id)
+
+    return c.json({ success: true, message: `Password set for ${target.displayName}` })
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error)
+    return c.json({ success: false, error: message }, 500)
+  }
+})
 // async function installSystemCronJobs() {
 //   const marker = '# pgbackrest-db-manager'
 //   const entries = [
