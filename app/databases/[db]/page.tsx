@@ -17,6 +17,8 @@ import {
   ArrowLeftIcon,
   ActivityIcon,
   RadioIcon,
+  ClockIcon,
+  PlayIcon,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -54,10 +56,13 @@ import {
   runCdcBackup,
   deleteBackup as apiDeleteBackup,
   startCdcDaemon,
+  listCronJobs,
+  updateCronJob,
+  runCronJobNow,
 } from "@/lib/api"
 import { DatabaseConfigDialog } from "@/components/database-config-dialog"
 import { RestoreDialog } from "@/components/restore-dialog"
-import type { DbConfig } from "@/lib/api"
+import type { DbConfig, CronJob } from "@/lib/api"
 
 type HealthStatus = "healthy" | "degraded" | "unprotected" | "unknown"
 
@@ -111,6 +116,19 @@ export default function DatabaseDetailPage() {
   const [isBackingUp, setIsBackingUp] = React.useState(false)
   const [isStartingDaemon, setIsStartingDaemon] = React.useState(false)
   const [isSettingUpCdc, setIsSettingUpCdc] = React.useState(false)
+  const [cronJobs, setCronJobs] = React.useState<CronJob[]>([])
+  const [cronTogglingId, setCronTogglingId] = React.useState<string | null>(null)
+  const [cronRunningId, setCronRunningId] = React.useState<string | null>(null)
+
+  const refreshCronJobs = React.useCallback(() => {
+    listCronJobs()
+      .then((jobs) => setCronJobs(jobs.filter((j) => j.db === dbName)))
+      .catch(() => setCronJobs([]))
+  }, [dbName])
+
+  React.useEffect(() => { refreshCronJobs() }, [refreshCronJobs])
+
+  const dbCronJobs = cronJobs.filter((j) => j.db === dbName)
 
   const cdcDbSet = React.useMemo(() => new Set(cdcStatuses.map((s) => s.db)), [cdcStatuses])
   const configMap = React.useMemo(() => new Map(dbConfigs.map((c) => [c.db, c])), [dbConfigs])
@@ -217,6 +235,37 @@ export default function DatabaseDetailPage() {
       })
     } finally {
       setIsSettingUpCdc(false)
+    }
+  }
+
+  async function handleToggleCron(id: string, enabled: boolean) {
+    setCronTogglingId(id)
+    try {
+      await updateCronJob(id, enabled)
+      toast.success(enabled ? "Schedule enabled" : "Schedule disabled")
+      refreshCronJobs()
+    } catch (err) {
+      toast.error("Failed to update schedule", {
+        description: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setCronTogglingId(null)
+    }
+  }
+
+  async function handleRunCronNow(id: string) {
+    setCronRunningId(id)
+    try {
+      await runCronJobNow(id)
+      toast.success("Backup job triggered")
+      refreshCronJobs()
+      refreshBackups()
+    } catch (err) {
+      toast.error("Failed to run job", {
+        description: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setCronRunningId(null)
     }
   }
 
@@ -463,6 +512,81 @@ export default function DatabaseDetailPage() {
             )}
           </CardContent>
         </Card>
+
+        {/* Scheduled jobs */}
+        {dbCronJobs.length > 0 && (
+          <Card className="shadow-none">
+            <CardHeader className="flex-row items-center justify-between">
+              <div>
+                <CardTitle className="text-sm font-semibold flex items-center gap-2">
+                  <ClockIcon className="size-4 text-muted-foreground" />
+                  Scheduled jobs
+                </CardTitle>
+              </div>
+              <span className="text-xs text-muted-foreground">
+                {dbCronJobs.length} job{dbCronJobs.length !== 1 ? "s" : ""}
+              </span>
+            </CardHeader>
+            <CardContent className="px-0">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-xs">Name</TableHead>
+                    <TableHead className="text-xs">Schedule</TableHead>
+                    <TableHead className="text-xs">Last run</TableHead>
+                    <TableHead className="text-xs">Next run</TableHead>
+                    <TableHead className="text-xs">Status</TableHead>
+                    <TableHead className="text-xs text-right">Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {dbCronJobs.map((job) => (
+                    <TableRow key={job.id}>
+                      <TableCell className="text-xs font-medium">{job.name}</TableCell>
+                      <TableCell className="text-xs font-mono text-muted-foreground">{job.expression}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">{job.lastRun || "—"}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">{job.nextRun || "—"}</TableCell>
+                      <TableCell>
+                        {job.enabled ? (
+                          <Badge variant="secondary" className="bg-emerald-50 text-emerald-700 border-emerald-200 text-xs">Enabled</Badge>
+                        ) : (
+                          <Badge variant="secondary" className="text-xs">Disabled</Badge>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          <Button
+                            variant="ghost"
+                            size="xs"
+                            onClick={() => handleRunCronNow(job.id)}
+                            disabled={cronRunningId === job.id}
+                          >
+                            {cronRunningId === job.id ? (
+                              <Loader2Icon className="size-3.5 animate-spin" />
+                            ) : (
+                              <PlayIcon className="size-3.5" />
+                            )}
+                            Run
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="xs"
+                            onClick={() => handleToggleCron(job.id, !job.enabled)}
+                            disabled={cronTogglingId === job.id}
+                          >
+                            {cronTogglingId === job.id ? (
+                              <Loader2Icon className="size-3.5 animate-spin" />
+                            ) : job.enabled ? "Disable" : "Enable"}
+                          </Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        )}
       </div>
 
       {/* Config dialog (centered modal) */}
@@ -473,6 +597,7 @@ export default function DatabaseDetailPage() {
         onOpenChange={setConfigDialogOpen}
         onSaved={() => {
           refreshDbConfigs()
+          refreshCronJobs()
         }}
       />
 
