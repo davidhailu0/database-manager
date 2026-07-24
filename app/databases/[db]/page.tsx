@@ -96,6 +96,7 @@ export default function DatabaseDetailPage() {
     backups,
     cdcStatuses,
     dbConfigs,
+    loading,
     addBackup,
     deleteBackup,
     refreshBackups,
@@ -108,6 +109,8 @@ export default function DatabaseDetailPage() {
   const [restoreBackup, setRestoreBackup] = React.useState<Backup | null>(null)
   const [restoreDialogOpen, setRestoreDialogOpen] = React.useState(false)
   const [isBackingUp, setIsBackingUp] = React.useState(false)
+  const [isStartingDaemon, setIsStartingDaemon] = React.useState(false)
+  const [isSettingUpCdc, setIsSettingUpCdc] = React.useState(false)
 
   const cdcDbSet = React.useMemo(() => new Set(cdcStatuses.map((s) => s.db)), [cdcStatuses])
   const configMap = React.useMemo(() => new Map(dbConfigs.map((c) => [c.db, c])), [dbConfigs])
@@ -120,7 +123,13 @@ export default function DatabaseDetailPage() {
     : "unprotected"
 
   const dbBackups = React.useMemo(() => {
-    return backups.filter((b) => b.db === dbName && b.source === "cdc")
+    return backups
+      .filter((b) => b.db === dbName && b.source === "cdc")
+      .sort((a, b) => {
+        const ta = new Date(a.createdAtIso ?? a.createdAt).getTime()
+        const tb = new Date(b.createdAtIso ?? b.createdAt).getTime()
+        return (isNaN(tb) ? 0 : tb) - (isNaN(ta) ? 0 : ta)
+      })
   }, [backups, dbName])
 
   const server = servers.find((s) => s.databases.includes(dbName))
@@ -129,7 +138,7 @@ export default function DatabaseDetailPage() {
     if (!dbName) return
     setIsBackingUp(true)
 
-    const placeholderId = "cdc_" + Math.random().toString(16).slice(2, 6)
+    const placeholderId = "cdc_" + (crypto.randomUUID?.() ?? Math.random().toString(16).slice(2, 10))
     addBackup({
       id: placeholderId,
       db: dbName,
@@ -182,6 +191,7 @@ export default function DatabaseDetailPage() {
   }
 
   async function handleStartDaemon() {
+    setIsStartingDaemon(true)
     try {
       await startCdcDaemon(dbName)
       toast.success(`Daemon started for "${dbName}"`)
@@ -190,10 +200,13 @@ export default function DatabaseDetailPage() {
       toast.error("Failed to start daemon", {
         description: err instanceof Error ? err.message : String(err),
       })
+    } finally {
+      setIsStartingDaemon(false)
     }
   }
 
   async function handleSetupCdc() {
+    setIsSettingUpCdc(true)
     try {
       await setupCdc(dbName)
       toast.success(`CDC protection enabled for "${dbName}"`)
@@ -202,6 +215,8 @@ export default function DatabaseDetailPage() {
       toast.error("CDC setup failed", {
         description: err instanceof Error ? err.message : String(err),
       })
+    } finally {
+      setIsSettingUpCdc(false)
     }
   }
 
@@ -347,13 +362,19 @@ export default function DatabaseDetailPage() {
             {config ? "Edit configuration" : "Configure"}
           </Button>
           {cdcStatus && !cdcStatus.daemonRunning && (
-            <Button variant="outline" size="sm" onClick={handleStartDaemon}>
-              Start daemon
+            <Button variant="outline" size="sm" onClick={handleStartDaemon} disabled={isStartingDaemon}>
+              {isStartingDaemon ? (
+                <Loader2Icon className="mr-1.5 size-3.5 animate-spin" />
+              ) : null}
+              {isStartingDaemon ? "Starting\u2026" : "Start daemon"}
             </Button>
           )}
           {!cdcDbSet.has(dbName) && (
-            <Button variant="outline" size="sm" onClick={handleSetupCdc}>
-              Enable CDC
+            <Button variant="outline" size="sm" onClick={handleSetupCdc} disabled={isSettingUpCdc}>
+              {isSettingUpCdc ? (
+                <Loader2Icon className="mr-1.5 size-3.5 animate-spin" />
+              ) : null}
+              {isSettingUpCdc ? "Enabling\u2026" : "Enable CDC"}
             </Button>
           )}
         </div>
@@ -378,7 +399,12 @@ export default function DatabaseDetailPage() {
             </span>
           </CardHeader>
           <CardContent className="px-0">
-            {dbBackups.length === 0 ? (
+            {loading ? (
+              <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
+                <Loader2Icon className="size-4 animate-spin" />
+                Loading backups…
+              </div>
+            ) : dbBackups.length === 0 ? (
               <div className="flex flex-col items-center gap-2 py-12 text-center text-sm text-muted-foreground">
                 <HardDriveDownloadIcon className="size-8" />
                 <span>No backups yet. Click &quot;Backup now&quot; to create one.</span>
@@ -445,7 +471,9 @@ export default function DatabaseDetailPage() {
         config={config}
         open={configDialogOpen}
         onOpenChange={setConfigDialogOpen}
-        onSaved={() => refreshDbConfigs()}
+        onSaved={() => {
+          refreshDbConfigs()
+        }}
       />
 
       {/* Restore dialog */}

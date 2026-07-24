@@ -26,6 +26,7 @@ import {
 } from "@/components/ui/select"
 import { upsertDbConfig, deleteDbConfig } from "@/lib/api"
 import type { DbConfig } from "@/lib/api"
+import { useDb } from "@/lib/db-context"
 
 const SCHEDULE_PRESETS: { label: string; value: string; description: string }[] = [
   { label: "Every minute", value: "* * * * *", description: "Runs every minute" },
@@ -56,10 +57,11 @@ function ConfigForm({
   onOpenChange: (open: boolean) => void
   onSaved?: () => void
 }) {
-  const defaultPath = `/var/backups/pg/${dbName}`
+  const { storagePath, retentionDays } = useDb()
+  const defaultPath = `${storagePath}/${dbName}`
   const [destinationPath, setDestinationPath] = React.useState(config?.destinationPath ?? defaultPath)
   const [scheduleCron, setScheduleCron] = React.useState(config?.scheduleCron ?? SCHEDULE_PRESETS[4].value)
-  const [keepLatest, setKeepLatest] = React.useState(String(config?.keepLatest ?? 7))
+  const [keepLatest, setKeepLatest] = React.useState(String(config?.keepLatest ?? retentionDays))
   const [enabled, setEnabled] = React.useState(config?.enabled ?? true)
   const [isSaving, setIsSaving] = React.useState(false)
   const [isDeleting, setIsDeleting] = React.useState(false)

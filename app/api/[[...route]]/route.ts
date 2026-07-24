@@ -3,7 +3,7 @@ import { handle } from 'hono/vercel'
 import postgres from 'postgres'
 import { execFile } from 'child_process'
 import { promisify } from 'util'
-import { randomUUID } from 'crypto'
+import { randomUUID, scryptSync, randomBytes, timingSafeEqual } from 'crypto'
 import { dirname, resolve } from 'path'
 import fs from 'fs'
 import Database from 'better-sqlite3'
@@ -393,6 +393,22 @@ function initDb() {
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+      token TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      user_data TEXT NOT NULL,
+      created_at INTEGER NOT NULL,
+      last_accessed INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS login_attempts (
+      ip TEXT PRIMARY KEY,
+      count INTEGER NOT NULL DEFAULT 1,
+      reset_at INTEGER NOT NULL
+    );
   `)
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_checkpoints_db_created ON health_checkpoints(db, created_at)') } catch {}
   // Schema migrations (idempotent)
@@ -400,6 +416,7 @@ function initDb() {
   try { db.exec('ALTER TABLE cron_jobs ADD COLUMN source TEXT NOT NULL DEFAULT \'pgbackrest\'') } catch {}
   try { db.exec('ALTER TABLE backups ADD COLUMN created_at_iso TEXT') } catch {}
   try { db.exec('ALTER TABLE servers ADD COLUMN ssh_user TEXT') } catch {}
+  try { db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT') } catch {}
   seedUsers()
   // Migrate admin allowed pages/actions to the new page structure
   try {
@@ -562,6 +579,82 @@ function listDbConfigs(): DbConfig[] {
   return rows.map(rowToDbConfig)
 }
 
+// --- App settings (persisted in SQLite) ---
+function getSetting(key: string, fallback: string): string {
+  const row = getDb().prepare('SELECT value FROM app_settings WHERE key = ?').get(key) as { value: string } | undefined
+  return row?.value ?? fallback
+}
+
+function setSetting(key: string, value: string): void {
+  getDb().prepare(
+    'INSERT INTO app_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).run(key, value)
+}
+
+function getStoragePath(): string {
+  return getSetting('storage_path', process.env.DB_BACKUP_PATH || '/var/backups/pg')
+}
+
+function getRetentionDays(): number {
+  return Number(getSetting('retention_days', process.env.DB_RETENTION_DAYS || '30'))
+}
+
+// --- Advanced settings (persisted in app_settings) ---
+function getAdAuthUrl(): string {
+  return getSetting('ad_auth_url', process.env.AD_AUTH_URL || 'https://letsreflectandthrive.et/ad-auth/authenticate')
+}
+
+function getSessionTtlMs(): number {
+  return Number(getSetting('session_ttl_ms', String(8 * 60 * 60 * 1000)))
+}
+
+function getLoginRateLimitWindowMs(): number {
+  return Number(getSetting('login_rate_limit_window_ms', String(15 * 60 * 1000)))
+}
+
+function getLoginRateLimitMax(): number {
+  return Number(getSetting('login_rate_limit_max', '10'))
+}
+
+function getHealthCheckLagThresholdBytes(): number {
+  return Number(getSetting('health_check_lag_threshold_bytes', String(1073741824)))
+}
+
+function getCdcMaxLagBytes(): number {
+  return Number(getSetting('cdc_max_lag_bytes', String(1073741824)))
+}
+
+function getCdcGracePeriodSeconds(): number {
+  return Number(getSetting('cdc_grace_period_seconds', '300'))
+}
+
+function getCdcLagWarnBytes(): number {
+  return Number(getSetting('cdc_lag_warn_bytes', String(50 * 1024 * 1024)))
+}
+
+function getCdcSlotInactiveSeconds(): number {
+  return Number(getSetting('cdc_slot_inactive_seconds', '600'))
+}
+
+function getCdcStreamStaleSeconds(): number {
+  return Number(getSetting('cdc_stream_stale_seconds', '120'))
+}
+
+function getCdcCheckIntervalSeconds(): number {
+  return Number(getSetting('cdc_check_interval_seconds', '60'))
+}
+
+function getCdcBaselineConcurrency(): number {
+  return Number(getSetting('cdc_baseline_concurrency', '3'))
+}
+
+/** Resolve the backup directory for a database: per-db config > global setting > default */
+function getBackupDirForDb(dbName: string): string {
+  const config = getDbConfig(dbName)
+  if (config && config.destinationPath) return config.destinationPath
+  return getStoragePath()
+}
+
 function getDbConfig(dbName: string): DbConfig | null {
   const db = getDb()
   const row = db.prepare('SELECT * FROM db_configs WHERE db = ?').get(dbName) as any
@@ -585,14 +678,16 @@ function deleteDbConfigByName(dbName: string): number {
   return getDb().prepare('DELETE FROM db_configs WHERE db = ?').run(dbName).changes
 }
 
-/** Enforce keep-latest retention: delete oldest backup records + on-disk files. */
+/** Enforce keep-latest retention: delete oldest backup records + on-disk files.
+ *  Uses per-db keepLatest from db_configs if available, otherwise falls back
+ *  to the global retention_days setting. */
 function enforceRetention(dbName: string): void {
   const config = getDbConfig(dbName)
-  if (!config) return
+  const keepLatest = config ? config.keepLatest : getRetentionDays()
   const db = getDb()
   const rows = db.prepare('SELECT * FROM backups WHERE db = ? AND source = ? AND status = ? ORDER BY created_at_iso DESC').all(dbName, 'cdc', 'Completed') as any[]
-  if (rows.length <= config.keepLatest) return
-  const toDelete = rows.slice(config.keepLatest)
+  if (rows.length <= keepLatest) return
+  const toDelete = rows.slice(keepLatest)
   for (const row of toDelete) {
     const backup = rowToBackup(row)
     if (backup.path) {
@@ -945,9 +1040,9 @@ app.post('/backups/delete', async (c) => {
     if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
 
     const { id } = await c.req.json()
-    if (!id) return c.json({ error: 'Backup ID is required' }, 400)
+    if (!id) return c.json({ success: false, error: 'Backup ID is required' }, 400)
     const changes = deleteBackupById(id)
-    if (changes === 0) return c.json({ error: 'Backup not found' }, 404)
+    if (changes === 0) return c.json({ success: false, error: 'Backup not found' }, 404)
     return c.json({ success: true, message: `Backup ${id} deleted` })
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
@@ -1023,16 +1118,19 @@ async function runCronBackup(job: CronJobRecord): Promise<string> {
     try {
       // Pass db name as a separate argv to avoid shell injection
       const cdcEnv = process.env.PG_CDC_ENV || '/etc/pg-cdc/pg-cdc.env'
+      const settingsBackupDir = getBackupDirForDb(job.db)
+      const dbConfig = getDbConfig(job.db)
+      const settingsRetention = dbConfig?.keepLatest ?? getRetentionDays()
       await sudoExec([
         'bash', '-c',
-        `set -a; . "${cdcEnv}"; set +a; exec /etc/pg-cdc/backup_db.sh "$1"`,
+        `set -a; . "${cdcEnv}"; set +a; export PGCDC_BACKUP_DIR="${settingsBackupDir}"; export PGCDC_RETENTION_DAYS="${settingsRetention}"; exec /etc/pg-cdc/backup_db.sh "$1"`,
         '--', job.db,
       ], { timeout: 3600_000 })
-      const backupDir = `/var/backups/pg/${job.db}`
+      const backupDir = settingsBackupDir
       let size = '—'
       let path: string | undefined
       try {
-        const files = fs.readdirSync(backupDir).filter(f => f.startsWith('base_') && f.endsWith('.dump')).sort().reverse()
+        const files = fs.readdirSync(backupDir).filter(f => f.startsWith(job.db + '-') && f.endsWith('.dump')).sort().reverse()
         if (files.length > 0) {
           const stat = fs.statSync(backupDir + '/' + files[0])
           const bytes = stat.size
@@ -1224,8 +1322,8 @@ app.get('/settings/storage', (c) => {
   if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
   return c.json({
     success: true,
-    storagePath: process.env.DB_BACKUP_PATH || '/var/backups/db',
-    retentionDays: Number(process.env.DB_RETENTION_DAYS || 30),
+    storagePath: getStoragePath(),
+    retentionDays: getRetentionDays(),
   })
 })
 
@@ -1236,14 +1334,14 @@ app.post('/settings/storage', async (c) => {
 
     const { storagePath, retentionDays } = await c.req.json()
     if (typeof storagePath !== 'string' || !storagePath.trim()) {
-      return c.json({ error: 'storagePath is required' }, 400)
+      return c.json({ success: false, error: 'storagePath is required' }, 400)
     }
     const days = Number(retentionDays)
     if (!Number.isFinite(days) || days < 1 || days > 365) {
-      return c.json({ error: 'retentionDays must be a number between 1 and 365' }, 400)
+      return c.json({ success: false, error: 'retentionDays must be a number between 1 and 365' }, 400)
     }
-    process.env.DB_BACKUP_PATH = storagePath
-    process.env.DB_RETENTION_DAYS = String(days)
+    setSetting('storage_path', storagePath.trim())
+    setSetting('retention_days', String(Math.floor(days)))
     return c.json({ success: true, message: 'Storage settings saved' })
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
@@ -1578,10 +1676,10 @@ async function writeConfigFile(path: string, content: string): Promise<void> {
 //
 //     const { config } = await c.req.json()
 //     if (!config || typeof config !== 'object') {
-//       return c.json({ error: 'config object is required' }, 400)
+//       return c.json({ success: false, error: 'config object is required' }, 400)
 //     }
 //     const iniError = validateIni(config)
-//     if (iniError) return c.json({ error: iniError }, 400)
+//     if (iniError) return c.json({ success: false, error: iniError }, 400)
 //
 //     const raw = serializeIni(config)
 //     await writeConfigFile(PGBACKREST_CONF, raw)
@@ -1599,10 +1697,10 @@ async function writeConfigFile(path: string, content: string): Promise<void> {
 //
 //     const { stanza } = await c.req.json()
 //     if (!stanza) {
-//       return c.json({ error: 'Stanza name is required' }, 400)
+//       return c.json({ success: false, error: 'Stanza name is required' }, 400)
 //     }
 //     if (!isValidStanza(stanza)) {
-//       return c.json({ error: 'Stanza name must match /^[a-z0-9_-]+$/i (max 64 chars)' }, 400)
+//       return c.json({ success: false, error: 'Stanza name must match /^[a-z0-9_-]+$/i (max 64 chars)' }, 400)
 //     }
 //     const { stdout, stderr } = await sudoExec(['-u', 'postgres', '/usr/bin/pgbackrest', `--stanza=${stanza}`, 'stanza-create'], { timeout: 30_000 })
 //     return c.json({ success: true, message: `Stanza "${stanza}" created`, output: stdout || stderr })
@@ -1644,23 +1742,23 @@ app.post('/servers', async (c) => {
 
     const { label, connectionUrl, sshUser } = await c.req.json()
     if (!label || !connectionUrl) {
-      return c.json({ error: 'Label and connection URL are required' }, 400)
+      return c.json({ success: false, error: 'Label and connection URL are required' }, 400)
     }
     if (!isValidStanza(label)) {
-      return c.json({ error: 'Label must match /^[a-z0-9_-]+$/i (max 64 chars) — it is used as a pgBackRest stanza name' }, 400)
+      return c.json({ success: false, error: 'Label must match /^[a-z0-9_-]+$/i (max 64 chars) — it is used as a pgBackRest stanza name' }, 400)
     }
     if (!isValidUrl(connectionUrl)) {
-      return c.json({ error: 'Invalid connection URL' }, 400)
+      return c.json({ success: false, error: 'Invalid connection URL' }, 400)
     }
     const engine = detectEngine(connectionUrl)
     if (!engine) {
-      return c.json({ error: 'Unsupported connection URL scheme' }, 400)
+      return c.json({ success: false, error: 'Unsupported connection URL scheme' }, 400)
     }
 
     // Reject duplicate label
     const existingServers = listServers()
     if (existingServers.some(s => s.label.toLowerCase() === label.toLowerCase())) {
-      return c.json({ error: `Server with label "${label}" already exists` }, 409)
+      return c.json({ success: false, error: `Server with label "${label}" already exists` }, 409)
     }
 
     const id = 'srv_' + randomUUID().slice(0, 8)
@@ -1892,13 +1990,13 @@ app.post('/servers', async (c) => {
             `backup_dir: /var/backups/pg\n` +
             `scripts_dir: /etc/pg-cdc\n` +
             `safety_valve:\n` +
-            `  max_lag_bytes: 1073741824\n` +
-            `  grace_period_seconds: 300\n` +
+            `  max_lag_bytes: ${getCdcMaxLagBytes()}\n` +
+            `  grace_period_seconds: ${getCdcGracePeriodSeconds()}\n` +
             `monitoring:\n` +
-            `  lag_warn_bytes: 52428800\n` +
-            `  slot_inactive_seconds: 600\n` +
-            `  stream_stale_seconds: 120\n` +
-            `  check_interval_seconds: 60\n` +
+            `  lag_warn_bytes: ${getCdcLagWarnBytes()}\n` +
+            `  slot_inactive_seconds: ${getCdcSlotInactiveSeconds()}\n` +
+            `  stream_stale_seconds: ${getCdcStreamStaleSeconds()}\n` +
+            `  check_interval_seconds: ${getCdcCheckIntervalSeconds()}\n` +
             `databases:\n`
         }
         // Keep pg_connection in sync with the newly added server when empty
@@ -1990,12 +2088,12 @@ app.post('/servers/delete', async (c) => {
     if (!admin) return c.json({ success: false, error: c.res.status === 403 ? 'Forbidden' : 'Not authenticated' }, c.res.status === 403 ? 403 : 401)
 
     const { id } = await c.req.json()
-    if (!id) return c.json({ error: 'Server ID is required' }, 400)
+    if (!id) return c.json({ success: false, error: 'Server ID is required' }, 400)
 
     // Look up the server before deleting so we know which databases to clean up
     const servers = listServers()
     const server = servers.find((s) => s.id === id)
-    if (!server) return c.json({ error: 'Server not found' }, 404)
+    if (!server) return c.json({ success: false, error: 'Server not found' }, 404)
 
     const cleanupErrors: string[] = []
 
@@ -2136,7 +2234,7 @@ app.post('/servers/delete', async (c) => {
         cleanupErrors.push(`Failed to remove CDC stream files for "${dbName}": ${e instanceof Error ? e.message : String(e)}`)
       }
       try {
-        await sudoExec(['rm', '-rf', `/var/backups/pg/${dbName}`], { timeout: 10_000 })
+        await sudoExec(['rm', '-rf', getBackupDirForDb(dbName)], { timeout: 10_000 })
       } catch (e: unknown) {
         cleanupErrors.push(`Failed to remove backup files for "${dbName}": ${e instanceof Error ? e.message : String(e)}`)
       }
@@ -2144,7 +2242,7 @@ app.post('/servers/delete', async (c) => {
 
     // 6. Delete the server from the database
     const changes = deleteServerById(id)
-    if (changes === 0) return c.json({ error: 'Server not found' }, 404)
+    if (changes === 0) return c.json({ success: false, error: 'Server not found' }, 404)
 
     return c.json({
       success: true,
@@ -2163,11 +2261,11 @@ app.post('/servers/discover', async (c) => {
     if (!user) return c.json({ success: false, error: 'Not authenticated' }, 401)
 
     const { id } = await c.req.json()
-    if (!id) return c.json({ error: 'Server ID is required' }, 400)
+    if (!id) return c.json({ success: false, error: 'Server ID is required' }, 400)
 
     const servers = listServers()
     const idx = servers.findIndex((s) => s.id === id)
-    if (idx === -1) return c.json({ error: 'Server not found' }, 404)
+    if (idx === -1) return c.json({ success: false, error: 'Server not found' }, 404)
 
     const server = servers[idx]
     let databases = server.databases
@@ -2204,48 +2302,57 @@ type AppUser = {
   createdAt: string
 }
 
-type AuthSession = {
-  token: string
-  user: AppUser
-  createdAt: number
-  lastAccessed: number
+// ---------------------------------------------------------------------------
+// Session management (persisted in SQLite)
+// ---------------------------------------------------------------------------
+function createSession(token: string, user: AppUser): void {
+  const now = Date.now()
+  getDb().prepare(
+    'INSERT INTO sessions (token, user_id, user_data, created_at, last_accessed) VALUES (?, ?, ?, ?, ?)'
+  ).run(token, user.id, JSON.stringify(user), now, now)
 }
 
-const SESSION_TTL_MS = 8 * 60 * 60 * 1000 // 8 hours
-
-const AD_AUTH_URL = 'https://letsreflectandthrive.et/ad-auth/authenticate'
-
-const sessions = new Map<string, AuthSession>()
-
-// ---------------------------------------------------------------------------
-// Login rate limiting — 10 attempts per 15 min per IP
-// ---------------------------------------------------------------------------
-const LOGIN_RATE_LIMIT_WINDOW_MS = 15 * 60 * 1000
-const LOGIN_RATE_LIMIT_MAX = 10
-const loginAttempts = new Map<string, { count: number; resetAt: number }>()
-
-function clientIp(c: any): string {
-  return c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
-    || c.req.header('x-real-ip')
-    || 'unknown'
+function deleteSession(token: string): void {
+  getDb().prepare('DELETE FROM sessions WHERE token = ?').run(token)
 }
 
+// ---------------------------------------------------------------------------
+// Login rate limiting — persisted in SQLite
+// ---------------------------------------------------------------------------
 function checkLoginRateLimit(ip: string): { allowed: boolean; retryAfterSec: number } {
   const now = Date.now()
-  const entry = loginAttempts.get(ip)
-  if (!entry || now > entry.resetAt) {
-    loginAttempts.set(ip, { count: 1, resetAt: now + LOGIN_RATE_LIMIT_WINDOW_MS })
+  const window = getLoginRateLimitWindowMs()
+  const max = getLoginRateLimitMax()
+  const db = getDb()
+
+  // Clean stale entries
+  db.prepare('DELETE FROM login_attempts WHERE ? >= reset_at').run(now)
+
+  const row = db.prepare('SELECT * FROM login_attempts WHERE ip = ?').get(ip) as any
+  if (!row) {
+    db.prepare('INSERT INTO login_attempts (ip, count, reset_at) VALUES (?, 1, ?)').run(ip, now + window)
     return { allowed: true, retryAfterSec: 0 }
   }
-  entry.count++
-  if (entry.count > LOGIN_RATE_LIMIT_MAX) {
-    return { allowed: false, retryAfterSec: Math.ceil((entry.resetAt - now) / 1000) }
+  if (now >= row.reset_at) {
+    db.prepare('UPDATE login_attempts SET count = 1, reset_at = ? WHERE ip = ?').run(now + window, ip)
+    return { allowed: true, retryAfterSec: 0 }
+  }
+  const newCount = row.count + 1
+  db.prepare('UPDATE login_attempts SET count = ? WHERE ip = ?').run(newCount, ip)
+  if (newCount > max) {
+    return { allowed: false, retryAfterSec: Math.ceil((row.reset_at - now) / 1000) }
   }
   return { allowed: true, retryAfterSec: 0 }
 }
 
 function resetLoginRateLimit(ip: string): void {
-  loginAttempts.delete(ip)
+  getDb().prepare('DELETE FROM login_attempts WHERE ip = ?').run(ip)
+}
+
+function clientIp(c: any): string {
+  return c.req.header('x-forwarded-for')?.split(',')[0]?.trim()
+    || c.req.header('x-real-ip')
+    || 'unknown'
 }
 
 function generateToken(): string {
@@ -2256,16 +2363,17 @@ function getSessionFromRequest(c: any): AppUser | null {
   const auth = c.req.header('Authorization')
   if (!auth || !auth.startsWith('Bearer ')) return null
   const token = auth.slice(7)
-  const session = sessions.get(token)
-  if (!session) return null
-  // Evict expired sessions
+  const db = getDb()
+  const row = db.prepare('SELECT * FROM sessions WHERE token = ?').get(token) as any
+  if (!row) return null
   const now = Date.now()
-  if (now - session.createdAt > SESSION_TTL_MS) {
-    sessions.delete(token)
+  const ttl = getSessionTtlMs()
+  if (now - row.created_at > ttl) {
+    db.prepare('DELETE FROM sessions WHERE token = ?').run(token)
     return null
   }
-  session.lastAccessed = now
-  return session.user
+  db.prepare('UPDATE sessions SET last_accessed = ? WHERE token = ?').run(now, token)
+  return JSON.parse(row.user_data)
 }
 
 const DEFAULT_ADMIN: AppUser = {
@@ -2282,11 +2390,37 @@ const DEFAULT_ADMIN: AppUser = {
   createdAt: new Date().toISOString(),
 }
 
+const LOCAL_ADMIN_PASSWORD = process.env.LOCAL_ADMIN_PASSWORD || 'admin123'
+
+function hashPassword(password: string): string {
+  const salt = randomBytes(16)
+  const hash = scryptSync(password, salt, 64)
+  return `scrypt:${salt.toString('hex')}:${hash.toString('hex')}`
+}
+
+function verifyPassword(password: string, stored: string): boolean {
+  try {
+    const [scheme, saltHex, hashHex] = stored.split(':')
+    if (scheme !== 'scrypt' || !saltHex || !hashHex) return false
+    const salt = Buffer.from(saltHex, 'hex')
+    const storedHash = Buffer.from(hashHex, 'hex')
+    const hash = scryptSync(password, salt, 64)
+    return hash.length === storedHash.length && timingSafeEqual(hash, storedHash)
+  } catch {
+    return false
+  }
+}
+
 function seedUsers() {
   const db = getDb()
   const count = db.prepare('SELECT COUNT(*) as c FROM users').get() as { c: number }
   if (count.c === 0) {
     insertUser(DEFAULT_ADMIN)
+  }
+  // Ensure the default admin has a local password for fallback auth
+  const admin = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(DEFAULT_ADMIN.id) as { password_hash: string | null } | undefined
+  if (admin && !admin.password_hash) {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(hashPassword(LOCAL_ADMIN_PASSWORD), DEFAULT_ADMIN.id)
   }
 }
 
@@ -2305,39 +2439,87 @@ app.post('/auth/login', async (c) => {
       return c.json({ success: false, error: 'Username and password are required' }, 400)
     }
 
-    // --- AD auth disabled (server unreachable — expired SSL cert) ---
-    // // Call AD auth API
-    // const adRes = await fetch(AD_AUTH_URL, {
-    //   method: 'POST',
-    //   headers: { 'Content-Type': 'application/json' },
-    //   body: JSON.stringify({ email: username, password }),
-    // })
-    // const adData = await adRes.json()
-    //
-    // if (!adData.success) {
-    //   return c.json({
-    //     success: false,
-    //     error: adData.message || 'Authentication failed',
-    //     details: adData.errors?.reason || 'Invalid credentials',
-    //   }, 401)
-    // }
-    //
-    // // Extract user info from AD response
-    // const adUser = adData.data?.user
-    // if (!adUser?.email) {
-    //   return c.json({ success: false, error: 'AD response missing user data' }, 500)
-    // }
-    //
-    // const localUsers = listUsers()
-    // const authorizedUser = localUsers.find(
-    //   (u) => u.email.toLowerCase() === adUser.email.toLowerCase() || u.samAccountName.toLowerCase() === adUser.sam_account_name?.toLowerCase()
-    // )
-
-    // --- Temporary: local-only auth — look up user directly in the DB ---
     const localUsers = listUsers()
-    const uname = username.toLowerCase().trim()
+
+    // --- Local authentication (primary) ---
+    // Try local auth first. This allows the app to function with local
+    // accounts (e.g., the default admin) without depending on the AD
+    // server. If local auth succeeds, return immediately.
+    const localUser = localUsers.find(
+      (u) => u.email.toLowerCase() === username.toLowerCase() ||
+             u.samAccountName.toLowerCase() === username.toLowerCase()
+    )
+    if (localUser) {
+      const row = getDb().prepare('SELECT password_hash FROM users WHERE id = ?').get(localUser.id) as { password_hash: string | null } | undefined
+      if (row?.password_hash && verifyPassword(password, row.password_hash)) {
+        resetLoginRateLimit(ip)
+        const token = generateToken()
+        createSession(token, localUser)
+        return c.json({
+          success: true,
+          token,
+          user: localUser,
+          message: `Welcome, ${localUser.displayName}`,
+          authMode: 'local',
+        })
+      }
+    }
+
+    // --- AD authentication (fallback) ---
+    // If local auth didn't match, try AD authentication.
+    let adRes: Response
+    try {
+      adRes = await fetch(getAdAuthUrl(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: username, password }),
+        signal: AbortSignal.timeout(15_000),
+      })
+    } catch {
+      return c.json({
+        success: false,
+        error: 'Authentication failed',
+        details: 'Unable to reach the AD authentication server and no matching local credentials found.',
+      }, 503)
+    }
+
+    if (!adRes.ok) {
+      return c.json({
+        success: false,
+        error: 'Authentication server error',
+        details: `AD auth server returned status ${adRes.status}`,
+      }, 502)
+    }
+
+    let adData: { success?: boolean; message?: string; errors?: { reason?: string }; data?: { user?: { email?: string; sam_account_name?: string } } }
+    try {
+      adData = await adRes.json()
+    } catch {
+      return c.json({
+        success: false,
+        error: 'Authentication server returned an invalid response',
+      }, 502)
+    }
+
+    if (!adData.success) {
+      return c.json({
+        success: false,
+        error: adData.message || 'Authentication failed',
+        details: adData.errors?.reason || 'Invalid credentials',
+      }, 401)
+    }
+
+    // Extract user info from AD response
+    const adUser = adData.data?.user
+    if (!adUser || !adUser.email) {
+      return c.json({ success: false, error: 'AD response missing user data' }, 500)
+    }
+    const adEmail = adUser.email.toLowerCase()
+    const adSam = (adUser.sam_account_name ?? '').toLowerCase()
+
+    // Check the local users table — only authorized users can log in
     const authorizedUser = localUsers.find(
-      (u) => u.email.toLowerCase() === uname || u.samAccountName.toLowerCase() === uname
+      (u) => u.email.toLowerCase() === adEmail || u.samAccountName.toLowerCase() === adSam
     ) ?? null
 
     if (!authorizedUser) {
@@ -2353,13 +2535,7 @@ app.post('/auth/login', async (c) => {
 
     // Create session
     const token = generateToken()
-    const now = Date.now()
-    sessions.set(token, {
-      token,
-      user: authorizedUser,
-      createdAt: now,
-      lastAccessed: now,
-    })
+    createSession(token, authorizedUser)
 
     return c.json({
       success: true,
@@ -2378,7 +2554,7 @@ app.post('/auth/logout', (c) => {
   const auth = c.req.header('Authorization')
   if (auth?.startsWith('Bearer ')) {
     const token = auth.slice(7)
-    sessions.delete(token)
+    deleteSession(token)
   }
   return c.json({ success: true, message: 'Logged out' })
 })
@@ -2439,19 +2615,19 @@ app.post('/users', async (c) => {
 
     const { email, samAccountName, displayName, department, title, role, allowedPages, allowedActions } = await c.req.json()
     if (!email || !samAccountName) {
-      return c.json({ error: 'Email and SAM account name are required' }, 400)
+      return c.json({ success: false, error: 'Email and SAM account name are required' }, 400)
     }
     if (role && !isValidRole(role)) {
-      return c.json({ error: `role must be one of: ${VALID_ROLES.join(', ')}` }, 400)
+      return c.json({ success: false, error: `role must be one of: ${VALID_ROLES.join(', ')}` }, 400)
     }
 
     const users = listUsers()
 
     if (users.some((u) => u.email.toLowerCase() === email.toLowerCase())) {
-      return c.json({ error: 'User with this email already exists' }, 409)
+      return c.json({ success: false, error: 'User with this email already exists' }, 409)
     }
     if (users.some((u) => u.samAccountName.toLowerCase() === samAccountName.toLowerCase())) {
-      return c.json({ error: 'User with this SAM account name already exists' }, 409)
+      return c.json({ success: false, error: 'User with this SAM account name already exists' }, 409)
     }
 
     const newUser: AppUser = {
@@ -2487,17 +2663,17 @@ app.post('/users/update', async (c) => {
 
     const users = listUsers()
     const idx = users.findIndex((u) => u.id === id)
-    if (idx === -1) return c.json({ error: 'User not found' }, 404)
+    if (idx === -1) return c.json({ success: false, error: 'User not found' }, 404)
 
     if (role !== undefined && !isValidRole(role)) {
-      return c.json({ error: `role must be one of: ${VALID_ROLES.join(', ')}` }, 400)
+      return c.json({ success: false, error: `role must be one of: ${VALID_ROLES.join(', ')}` }, 400)
     }
 
     // Last-admin protection: don't let the last admin demote themselves.
     if (role && role !== 'admin' && users[idx].role === 'admin' && users[idx].id === admin.id) {
       const otherAdmins = users.filter(u => u.role === 'admin' && u.id !== id)
       if (otherAdmins.length === 0) {
-        return c.json({ error: 'Cannot demote yourself — you are the last admin' }, 400)
+        return c.json({ success: false, error: 'Cannot demote yourself — you are the last admin' }, 400)
       }
     }
 
@@ -2524,11 +2700,11 @@ app.post('/users/delete', async (c) => {
     if (admin.role !== 'admin') return c.json({ success: false, error: 'Forbidden' }, 403)
 
     const { id } = await c.req.json()
-    if (!id) return c.json({ error: 'User ID is required' }, 400)
+    if (!id) return c.json({ success: false, error: 'User ID is required' }, 400)
 
     // Self-delete protection
     if (id === admin.id) {
-      return c.json({ error: 'Cannot delete yourself' }, 400)
+      return c.json({ success: false, error: 'Cannot delete yourself' }, 400)
     }
 
     // Last-admin protection
@@ -2537,12 +2713,12 @@ app.post('/users/delete', async (c) => {
     if (target?.role === 'admin') {
       const otherAdmins = users.filter(u => u.role === 'admin' && u.id !== id)
       if (otherAdmins.length === 0) {
-        return c.json({ error: 'Cannot remove the last admin' }, 400)
+        return c.json({ success: false, error: 'Cannot remove the last admin' }, 400)
       }
     }
 
     const changes = deleteUserById(id)
-    if (changes === 0) return c.json({ error: 'User not found' }, 404)
+    if (changes === 0) return c.json({ success: false, error: 'User not found' }, 404)
 
     return c.json({ success: true, message: 'User deleted' })
   } catch (error: unknown) {
@@ -2551,7 +2727,6 @@ app.post('/users/delete', async (c) => {
   }
 })
 
-// Install system crontab entries for pgbackrest via subprocess
 // async function installSystemCronJobs() {
 //   const marker = '# pgbackrest-db-manager'
 //   const entries = [
@@ -2676,12 +2851,12 @@ app.get('/cdc/status', async (c) => {
         streamStaleSec = Math.floor((Date.now() - fs.statSync(streamFile).mtimeMs) / 1000)
       }
 
-      const backupDir = `/var/backups/pg/${db}`
+      const backupDir = getBackupDirForDb(db)
       let lastBaseline: string | null = null
       if (fs.existsSync(backupDir)) {
-        const files = fs.readdirSync(backupDir).filter(f => f.startsWith('base_') && f.endsWith('.dump')).sort().reverse()
+        const files = fs.readdirSync(backupDir).filter(f => f.startsWith(db + '-') && f.endsWith('.dump')).sort().reverse()
         if (files.length > 0) {
-          const m = files[0].match(/^base_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/)
+          const m = files[0].match(/^.+-(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})/)
           lastBaseline = m ? `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6]}Z` : files[0]
         }
       }
@@ -2791,17 +2966,20 @@ app.post('/cdc/backup', async (c) => {
 
     try {
       // Pass db name as argv ($1) — never interpolate into the shell string
+      const settingsBackupDir = getBackupDirForDb(dbName)
+      const dbConfig = getDbConfig(dbName)
+      const settingsRetention = dbConfig?.keepLatest ?? getRetentionDays()
       const { stdout } = await sudoExec([
         'bash', '-c',
-        `set -a; . "${PG_CDC_ENV}"; set +a; exec /etc/pg-cdc/backup_db.sh "$1"`,
+        `set -a; . "${PG_CDC_ENV}"; set +a; export PGCDC_BACKUP_DIR="${settingsBackupDir}"; export PGCDC_RETENTION_DAYS="${settingsRetention}"; exec /etc/pg-cdc/backup_db.sh "$1"`,
         '--', dbName,
       ], { timeout: 3600_000 })
 
       let size = '—'
       let path: string | undefined
-      const backupDir = `/var/backups/pg/${dbName}`
+      const backupDir = settingsBackupDir
       try {
-        const files = fs.readdirSync(backupDir).filter(f => f.startsWith('base_') && f.endsWith('.dump')).sort().reverse()
+        const files = fs.readdirSync(backupDir).filter(f => f.startsWith(dbName + '-') && f.endsWith('.dump')).sort().reverse()
         if (files.length > 0) {
           const stat = fs.statSync(backupDir + '/' + files[0])
           const bytes = stat.size
@@ -2916,7 +3094,7 @@ app.post('/cdc/health-check', async (c) => {
             checks.push({ db: dbName, healthy: false, walLsn: '', detail: 'Replication slot inactive' })
           } else {
             const lagBytes = Number(slots[0].lag_bytes) || 0
-            const healthy = lagBytes < 1073741824 // 1 GB threshold
+            const healthy = lagBytes < getHealthCheckLagThresholdBytes()
             checks.push({ db: dbName, healthy, walLsn: globalWalLsn, detail: healthy ? 'OK' : `Lag ${(lagBytes / 1048576).toFixed(1)} MB exceeds threshold` })
           }
         } catch (err: unknown) {
@@ -3340,7 +3518,7 @@ async function reconcileOrphanedResources(): Promise<ReconcileResult> {
       await sudoExec(['rm', '-rf', `/var/pg-cdc/${db}`], { timeout: 10_000 })
     } catch { /* best-effort */ }
     try {
-      await sudoExec(['rm', '-rf', `/var/backups/pg/${db}`], { timeout: 10_000 })
+      await sudoExec(['rm', '-rf', getBackupDirForDb(db)], { timeout: 10_000 })
     } catch { /* best-effort */ }
   }
 

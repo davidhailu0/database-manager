@@ -10,6 +10,7 @@ import {
   RadioIcon,
   DatabaseIcon,
   HardDriveIcon,
+  Loader2Icon,
 } from "lucide-react"
 
 import { AppShell } from "@/components/app-shell"
@@ -25,6 +26,17 @@ import { Badge } from "@/components/ui/badge"
 import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog"
 import { useDb } from "@/lib/db-context"
 import {
   createServer,
@@ -35,11 +47,24 @@ import {
 } from "@/lib/api"
 import type { ServerRecord } from "@/lib/api"
 
+function maskConnectionUrl(url: string): string {
+  try {
+    const u = new URL(url)
+    if (u.password) {
+      u.password = "\u2022\u2022\u2022\u2022"
+    }
+    return u.toString()
+  } catch {
+    return url
+  }
+}
+
 function AddServerCard({ onAdded }: { onAdded: () => void }) {
   const [label, setLabel] = React.useState("")
   const [url, setUrl] = React.useState("")
   const [sshUser, setSshUser] = React.useState("")
   const [isAdding, setIsAdding] = React.useState(false)
+  const { refreshCdcStatus } = useDb()
 
   async function handleAdd() {
     if (!label.trim() || !url.trim()) {
@@ -55,7 +80,6 @@ function AddServerCard({ onAdded }: { onAdded: () => void }) {
       else if (result.stanzaMessage) msg = ` — ${result.stanzaMessage}`
       toast.success(`Server "${label}" added${msg}`)
 
-      // Auto-setup pg-cdc for discovered PostgreSQL databases
       if (result.server.databases.length > 0 && result.server.engine === "PostgreSQL") {
         for (const db of result.server.databases) {
           try {
@@ -73,6 +97,7 @@ function AddServerCard({ onAdded }: { onAdded: () => void }) {
       setUrl("")
       setSshUser("")
       onAdded()
+      refreshCdcStatus()
     } catch (err) {
       toast.error("Failed to add server", {
         description: err instanceof Error ? err.message : String(err),
@@ -111,19 +136,25 @@ function AddServerCard({ onAdded }: { onAdded: () => void }) {
 
 function ServerRow({ server, onRefresh }: { server: ServerRecord; onRefresh: () => void }) {
   const [isDiscovering, setIsDiscovering] = React.useState(false)
-  const { cdcStatuses, setupCdc } = useDb()
+  const [isDeleting, setIsDeleting] = React.useState(false)
+  const [cdcLoadingDb, setCdcLoadingDb] = React.useState<string | null>(null)
+  const { cdcStatuses, setupCdc, refreshCdcStatus } = useDb()
 
   const protectedDbs = new Set(cdcStatuses.map((s) => s.db))
 
   async function handleDelete() {
+    setIsDeleting(true)
     try {
       await deleteServer(server.id)
       toast.success(`Server "${server.label}" deleted`)
       onRefresh()
+      refreshCdcStatus()
     } catch (err) {
       toast.error("Failed to delete server", {
         description: err instanceof Error ? err.message : String(err),
       })
+    } finally {
+      setIsDeleting(false)
     }
   }
 
@@ -142,6 +173,22 @@ function ServerRow({ server, onRefresh }: { server: ServerRecord; onRefresh: () 
     }
   }
 
+  async function handleSetupCdc(db: string) {
+    setCdcLoadingDb(db)
+    try {
+      await setupCdc(db)
+      toast.success(`CDC protection enabled for "${db}"`)
+      onRefresh()
+      refreshCdcStatus()
+    } catch (err) {
+      toast.error("CDC setup failed", {
+        description: err instanceof Error ? err.message : String(err),
+      })
+    } finally {
+      setCdcLoadingDb(null)
+    }
+  }
+
   return (
     <div className="rounded-md border px-4 py-3">
       <div className="flex items-center justify-between">
@@ -151,16 +198,30 @@ function ServerRow({ server, onRefresh }: { server: ServerRecord; onRefresh: () 
           </div>
           <div className="flex flex-col">
             <span className="text-sm font-medium">{server.label}</span>
-            <span className="text-xs text-muted-foreground font-mono truncate max-w-80">{server.connectionUrl}</span>
+            <span className="text-xs text-muted-foreground font-mono truncate max-w-80">{maskConnectionUrl(server.connectionUrl)}</span>
           </div>
         </div>
         <div className="flex items-center gap-1">
           <Button variant="ghost" size="sm" onClick={handleDiscover} disabled={isDiscovering}>
-            <RefreshCwIcon className="size-3.5" />
+            {isDiscovering ? <Loader2Icon className="size-3.5 animate-spin" /> : <RefreshCwIcon className="size-3.5" />}
           </Button>
-          <Button variant="ghost" size="sm" onClick={handleDelete}>
-            <Trash2Icon className="size-3.5" />
-          </Button>
+          <AlertDialog>
+            <AlertDialogTrigger render={<Button variant="ghost" size="sm" disabled={isDeleting} />}>
+              {isDeleting ? <Loader2Icon className="size-3.5 animate-spin" /> : <Trash2Icon className="size-3.5" />}
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Delete server &quot;{server.label}&quot;?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  This will remove the server and all its discovered databases. CDC protection, replication slots, and scheduled jobs for these databases will also be cleaned up.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={handleDelete}>Delete</AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </div>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-2">
@@ -176,21 +237,12 @@ function ServerRow({ server, onRefresh }: { server: ServerRecord; onRefresh: () 
               <span title="CDC protected"><RadioIcon className="size-3 text-emerald-500" /></span>
             ) : server.engine === "PostgreSQL" ? (
               <button
-                className="text-xs text-muted-foreground hover:text-primary cursor-pointer"
-                onClick={async () => {
-                  try {
-                    await setupCdc(db)
-                    toast.success(`CDC protection enabled for "${db}"`)
-                    onRefresh()
-                  } catch (err) {
-                    toast.error("CDC setup failed", {
-                      description: err instanceof Error ? err.message : String(err),
-                    })
-                  }
-                }}
+                className="text-xs text-muted-foreground hover:text-primary cursor-pointer disabled:opacity-50"
+                onClick={() => handleSetupCdc(db)}
+                disabled={cdcLoadingDb === db}
                 title="Enable CDC protection"
               >
-                +CDC
+                {cdcLoadingDb === db ? "\u2026" : "+CDC"}
               </button>
             ) : null}
           </div>
@@ -204,7 +256,7 @@ function ServerRow({ server, onRefresh }: { server: ServerRecord; onRefresh: () 
 }
 
 export default function SettingsPage() {
-  const { servers, refreshServers } = useDb()
+  const { servers, refreshServers, loading } = useDb()
 
   return (
     <AppShell>
@@ -228,7 +280,12 @@ export default function SettingsPage() {
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            {servers.length === 0 ? (
+            {loading ? (
+              <div className="flex items-center justify-center gap-2 py-6 text-sm text-muted-foreground">
+                <Loader2Icon className="size-4 animate-spin" />
+                Loading servers…
+              </div>
+            ) : servers.length === 0 ? (
               <div className="flex flex-col items-center gap-2 py-6 text-center text-sm text-muted-foreground">
                 <ServerIcon className="size-8" />
                 <span>No servers configured. Add one below to get started.</span>

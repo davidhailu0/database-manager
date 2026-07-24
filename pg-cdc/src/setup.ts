@@ -38,6 +38,23 @@ export async function setupDatabase(cfg: PgCdcConfig, dbName: string): Promise<S
   const pubName = `${dbName}_pub`
   const slotName = `${dbName}_cdc`
 
+  // ---- 1. Pre-flight: verify the database exists on the cluster ----
+  // Connect to the maintenance database (pg_connection) and check pg_database
+  // before attempting to connect to the target DB. This produces a clear error
+  // instead of a misleading wal_level/wal2json hint when the DB is stale.
+  const adminSql = postgres(cfg.pg_connection, { max: 1, idle_timeout: 5 })
+  try {
+    const found = await adminSql`SELECT 1 FROM pg_catalog.pg_database WHERE datname = ${dbName}`
+    if (found.length === 0) {
+      throw new Error(
+        `Database "${dbName}" does not exist on the PostgreSQL cluster.\n` +
+        `Create the database first, or verify the name and that pg_connection points to the correct cluster.`,
+      )
+    }
+  } finally {
+    await adminSql.end()
+  }
+
   // ---- 2+3. Connect to the TARGET database for slot + publication ----
   // Slots must be created on the database they capture changes for, and
   // pg_recvlogical must connect to that same database to consume them.
@@ -67,6 +84,15 @@ export async function setupDatabase(cfg: PgCdcConfig, dbName: string): Promise<S
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err)
+
+    // Database doesn't exist — distinct from wal_level/plugin issues
+    if (/does not exist/i.test(msg)) {
+      throw new Error(
+        `Failed to set up replication for "${dbName}": ${msg}\n` +
+        `Database "${dbName}" does not exist on the cluster. Create it first or verify the pg_connection setting.`,
+      )
+    }
+
     const hints: string[] = []
     if (/wal_level/i.test(msg) || /logical decoding requires/i.test(msg)) {
       hints.push(

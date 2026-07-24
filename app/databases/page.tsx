@@ -4,7 +4,6 @@ import * as React from "react"
 import Link from "next/link"
 import {
   DatabaseIcon,
-  HardDriveDownloadIcon,
   RefreshCwIcon,
   Link2Icon,
   SettingsIcon,
@@ -12,6 +11,7 @@ import {
   XCircleIcon,
   AlertCircleIcon,
   ActivityIcon,
+  Loader2Icon,
 } from "lucide-react"
 import { toast } from "sonner"
 
@@ -71,6 +71,7 @@ export default function DatabasesPage() {
     backups,
     cdcStatuses,
     dbConfigs,
+    loading,
     refreshBackups,
     refreshCdcStatus,
     refreshDbConfigs,
@@ -78,15 +79,17 @@ export default function DatabasesPage() {
 
   const [serverFilter, setServerFilter] = React.useState<string>("__all__")
 
-  // Gather all databases from all servers
+  // Gather all databases from all servers, keyed by server id + db name
+  // to avoid collisions when the same db name exists on multiple servers.
   const allDbs = React.useMemo(() => {
     const seen = new Set<string>()
-    const dbs: { server: string; engine: string; name: string }[] = []
+    const dbs: { serverId: string; serverLabel: string; engine: string; name: string }[] = []
     for (const s of servers) {
       for (const db of s.databases) {
-        if (!seen.has(db)) {
-          seen.add(db)
-          dbs.push({ server: s.label, engine: s.engine, name: db })
+        const key = `${s.id}:${db}`
+        if (!seen.has(key)) {
+          seen.add(key)
+          dbs.push({ serverId: s.id, serverLabel: s.label, engine: s.engine, name: db })
         }
       }
     }
@@ -95,7 +98,7 @@ export default function DatabasesPage() {
 
   const filteredDbs = React.useMemo(() => {
     if (serverFilter === "__all__") return allDbs
-    return allDbs.filter((d) => d.server === serverFilter)
+    return allDbs.filter((d) => d.serverId === serverFilter)
   }, [allDbs, serverFilter])
 
   const configMap = React.useMemo(() => new Map(dbConfigs.map((c) => [c.db, c])), [dbConfigs])
@@ -112,7 +115,13 @@ export default function DatabasesPage() {
   }
 
   function getLastBackup(dbName: string): { createdAt: string } | null {
-    const dbBackups = backups.filter((b) => b.db === dbName && b.source === "cdc")
+    const dbBackups = backups
+      .filter((b) => b.db === dbName && b.source === "cdc")
+      .sort((a, b) => {
+        const ta = new Date(a.createdAtIso ?? a.createdAt).getTime()
+        const tb = new Date(b.createdAtIso ?? b.createdAt).getTime()
+        return (isNaN(tb) ? 0 : tb) - (isNaN(ta) ? 0 : ta)
+      })
     if (dbBackups.length === 0) return null
     return dbBackups[0]
   }
@@ -146,7 +155,14 @@ export default function DatabasesPage() {
           </div>
         </div>
 
-        {allDbs.length === 0 ? (
+        {loading ? (
+          <Card className="shadow-none">
+            <CardContent className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
+              <Loader2Icon className="size-4 animate-spin" />
+              Loading databases…
+            </CardContent>
+          </Card>
+        ) : allDbs.length === 0 ? (
           <Card className="shadow-none">
             <CardContent className="flex flex-col items-center gap-3 py-12 text-center">
               <DatabaseIcon className="size-10 text-muted-foreground" />
@@ -162,7 +178,7 @@ export default function DatabasesPage() {
           </Card>
         ) : (
           <>
-          {servers.length > 1 && (
+          {servers.length >= 1 && (
             <div className="flex flex-wrap items-center gap-1.5">
               <button
                 onClick={() => setServerFilter("__all__")}
@@ -175,13 +191,13 @@ export default function DatabasesPage() {
                 All ({allDbs.length})
               </button>
               {servers.map((s) => {
-                const count = allDbs.filter((d) => d.server === s.label).length
+                const count = allDbs.filter((d) => d.serverId === s.id).length
                 return (
                   <button
                     key={s.id}
-                    onClick={() => setServerFilter(s.label)}
+                    onClick={() => setServerFilter(s.id)}
                     className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                      serverFilter === s.label
+                      serverFilter === s.id
                         ? "bg-primary text-primary-foreground"
                         : "bg-muted text-muted-foreground hover:bg-muted/80"
                     }`}
@@ -192,8 +208,16 @@ export default function DatabasesPage() {
               })}
             </div>
           )}
+          {filteredDbs.length === 0 ? (
+            <Card className="shadow-none">
+              <CardContent className="flex flex-col items-center gap-2 py-8 text-center text-sm text-muted-foreground">
+                <DatabaseIcon className="size-6" />
+                <span>No databases on the selected server.</span>
+              </CardContent>
+            </Card>
+          ) : (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-            {filteredDbs.map(({ name, server, engine }) => {
+            {filteredDbs.map(({ name, serverLabel, engine }) => {
               const health = getHealthStatus(name)
               const info = healthInfo(health)
               const HealthIcon = info.icon
@@ -202,7 +226,7 @@ export default function DatabasesPage() {
               const hasConfig = configMap.has(name)
 
               return (
-                <Link key={name} href={`/databases/${encodeURIComponent(name)}`} className="block">
+                <Link key={`${serverLabel}:${name}`} href={`/databases/${encodeURIComponent(name)}`} className="block">
                 <Card
                   className="shadow-none cursor-pointer transition-all hover:ring-2 hover:ring-primary/20"
                 >
@@ -214,7 +238,7 @@ export default function DatabasesPage() {
                         </div>
                         <div className="flex flex-col">
                           <CardTitle className="text-sm font-mono">{name}</CardTitle>
-                          <span className="text-xs text-muted-foreground">{server}</span>
+                          <span className="text-xs text-muted-foreground">{serverLabel}</span>
                         </div>
                       </div>
                       <Badge variant="secondary" className={`text-xs ${info.badge}`}>
@@ -257,6 +281,7 @@ export default function DatabasesPage() {
               )
             })}
           </div>
+          )}
           </>
         )}
       </div>
